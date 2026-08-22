@@ -1,6 +1,6 @@
-# cordis.patch.yml —— 按包名引用，让 Node 解析已安装代码
+# cordis.patch.yml —— bundle 配置层。
+# 插件行按包名引用,Node 从 profile 的 node_modules 解析已安装代码;
+# 本地开发时先 `pnpm build` 生成 lib/,再 `dsh plugin --profile <name> add <本目录>`。
 - insert:
-    - id: dsh-agnes-image
-      name: /home/lc/dsh-agnes/index.ts
-      
-      
+    - id: agnes
+      name: dsh-agnes

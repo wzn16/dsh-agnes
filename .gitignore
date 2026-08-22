@@ -1,8 +1,12 @@
 node_modules/
 dist/
+lib/
 *.log
 .env
 .env.*
 !.env.example
 .DS_Store
 *.tsbuildinfo
+.smoke-dsh/
+.xdg/
+*.tgz

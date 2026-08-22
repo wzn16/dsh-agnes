@@ -232,8 +232,12 @@ export function renderAgnesVideoValue(args: AgnesVideoArgs, value: AgnesVideoVal
   if (value.size !== undefined) lines.push(`分辨率:${value.size}`)
   if (value.seconds !== undefined) lines.push(`时长:${value.seconds} 秒`)
   if (value.url !== undefined) lines.push(`视频 URL:${value.url}`)
-  if (value.size_mapping !== null && typeof value.size_mapping === 'object' && typeof value.size_mapping.message === 'string') {
-    lines.push(`尺寸标准化:${value.size_mapping.message}`)
+  const sizeMapping = value.size_mapping
+  if (
+    sizeMapping !== null && typeof sizeMapping === 'object' && !Array.isArray(sizeMapping)
+    && typeof sizeMapping.message === 'string'
+  ) {
+    lines.push(`尺寸标准化:${sizeMapping.message}`)
   }
   if (value.status === 'failed') {
     const err = value.error
