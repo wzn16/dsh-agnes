@@ -1,7 +1,7 @@
 {
   "name": "dsh-agnes",
-  "description": "Agnes AI image & video generation tools for DSH (agnes_image_generate / agnes_video_generate)",
-  "version": "0.2.0",
+  "description": "Agnes AI image & video generation tools for DSH (agnes_image_generate / agnes_video_generate) with an Agnes settings tab",
+  "version": "0.3.0",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -28,6 +28,9 @@
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
     }
   },
   "files": [
@@ -35,13 +38,22 @@
     "cordis.patch.yml"
   ],
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && node scripts/copy-client.mjs",
     "check": "tsc --noEmit",
+    "test": "node scripts/smoke.mjs",
     "prepare": "pnpm run build"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
     }
   },
   "peerDependencies": {
