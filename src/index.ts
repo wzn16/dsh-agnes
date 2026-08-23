@@ -6,6 +6,13 @@ import { applyAgnesTool, DEFAULT_IMAGE_MODEL, RATIOS, SIZE_TIERS } from './image
 import { applyAgnesVideoTool, DEFAULT_VIDEO_MODEL } from './video.ts'
 export const name = 'dsh-agnes'
 
+/**
+ * 插件注册工具前需等待 tools 服务就绪;
+ * 工具执行经属性访问(ctx.shell)使用 shell 服务发起 curl,必须在 inject 中声明,
+ * 否则运行时报 `cannot get property "shell" without inject`。
+ */
+export const inject = ['tools', 'shell'] as const
+
 /** 设置命名空间；浏览器端会再次声明。 */
 export const AGNES_SETTINGS_NAMESPACE = settingsNamespace('agnes')
 
