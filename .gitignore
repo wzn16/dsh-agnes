@@ -1,6 +1,5 @@
 node_modules/
 dist/
-lib/
 *.log
 .env
 .env.*
@@ -10,3 +9,4 @@ lib/
 .smoke-dsh/
 .xdg/
 *.tgz
+docs/
