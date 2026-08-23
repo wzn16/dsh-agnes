@@ -1,7 +1,9 @@
 /**
- * `agnes_video_generate` 工具:通过 Agnes Video V2.0 API 实现文生视频、图生视频和关键帧动画。
+ * `agnes_video_generate` 工具:通过 Agnes 视频 API 实现文生视频、图生视频和关键帧动画。
  * 视频生成是异步任务:先创建任务,再轮询查询结果直到完成或失败。
  * 请求体写入 curl 标准输入,密钥通过进程环境传递,均不进入命令行。
+ * 模型名称与默认 width/height/num_frames/frame_rate 来自设置命名空间(设置页的 Agnes 标签页),
+ * 不硬编码,上游模型升级时改设置即可。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -21,8 +23,8 @@ export const AGNES_VIDEO_API_URL = 'https://api.agnes-ai.cn/v1/videos'
 /** Agnes 视频 API 端点:按 video_id 查询结果(推荐)。 */
 export const AGNES_VIDEO_QUERY_URL = 'https://api.agnes-ai.cn/agnesapi'
 
-/** 视频生成模型。 */
-export const AGNES_VIDEO_MODEL = 'agnes-video-v2.0'
+/** 视频生成模型的文档默认值;仅作 schema 默认,实际模型始终读自设置。 */
+export const DEFAULT_VIDEO_MODEL = 'agnes-video-v2.0'
 
 /** 创建/查询单次请求的 curl 网络超时。 */
 export const AGNES_VIDEO_CURL_TIMEOUT_S = 60
@@ -44,20 +46,34 @@ export interface AgnesVideoArgs {
   image?: string
   /** 关键帧动画模式:公共 HTTPS 图片 URL 数组,至少两张。 */
   keyframes?: string[]
-  /** 视频宽度,默认 1152;不支持的精确尺寸由 API 标准化。 */
+  /** 视频宽度;未提供时回退到设置默认值。 */
   width?: number
-  /** 视频高度,默认 768;不支持的精确尺寸由 API 标准化。 */
+  /** 视频高度;未提供时回退到设置默认值。 */
   height?: number
-  /** 视频帧数,必须 ≤ 441 且遵循 8n + 1 规则。 */
+  /** 视频帧数,必须 ≤ 441 且遵循 8n + 1 规则;未提供时回退到设置默认值。 */
   num_frames?: number
-  /** 视频帧率,支持 1–60。 */
+  /** 视频帧率,支持 1–60;未提供时回退到设置默认值。 */
   frame_rate?: number
-  /** 随机种子,用于可复现结果。 */
+  /** 随机种子,用于可复现结果;不设默认值,保持每次随机。 */
   seed?: number
   /** 反向提示词,描述需要避免的内容。 */
   negative_prompt?: string
   /** 推理步数。 */
   num_inference_steps?: number
+}
+
+/** 调用时由设置命名空间解析出的视频默认值;模型名随上游升级在设置中修改。 */
+export interface VideoDefaults {
+  /** 视频生成模型名称。 */
+  model: string
+  /** 默认视频宽度。 */
+  width: number
+  /** 默认视频高度。 */
+  height: number
+  /** 默认帧数(≤441 且满足 8n+1)。 */
+  numFrames: number
+  /** 默认帧率(1–60)。 */
+  frameRate: number
 }
 
 /** 创建任务响应中的关键字段。 */
@@ -98,50 +114,65 @@ export interface AgnesVideoValue {
 const VIDEO_IMAGE_PATTERN = /^https?:\/\//
 
 /**
- * 根据参数构建创建任务的 API 请求体。
- * @throws 参数不合法时抛出面向模型的错误。
+ * 合并工具参数与设置默认值:参数省略的字段落回到设置值,
+ * 再走同一套校验,因此设置里的非法取值与非法参数报同样的错。
  */
-export function buildAgnesVideoRequestBody(args: AgnesVideoArgs): Record<string, unknown> {
+function resolveWithDefaults(args: AgnesVideoArgs, defaults: VideoDefaults): Required<Pick<AgnesVideoArgs, 'width' | 'height' | 'num_frames' | 'frame_rate'>> & AgnesVideoArgs {
+  return {
+    ...args,
+    width: args.width ?? defaults.width,
+    height: args.height ?? defaults.height,
+    num_frames: args.num_frames ?? defaults.numFrames,
+    frame_rate: args.frame_rate ?? defaults.frameRate,
+  }
+}
+
+/**
+ * 根据参数构建创建任务的 API 请求体。
+ * @throws 参数或设置默认值不合法时抛出面向模型的错误。
+ */
+export function buildAgnesVideoRequestBody(args: AgnesVideoArgs, defaults: VideoDefaults): Record<string, unknown> {
+  const effective = resolveWithDefaults(args, defaults)
   const body: Record<string, unknown> = {
-    model: AGNES_VIDEO_MODEL,
-    prompt: args.prompt,
+    model: defaults.model,
+    prompt: effective.prompt,
   }
-  if (args.width !== undefined) {
-    if (!Number.isInteger(args.width) || args.width <= 0) {
-      throw new Error(`无效的 width ${args.width}:必须是正整数。`)
+  if (effective.width !== undefined) {
+    if (!Number.isInteger(effective.width) || effective.width <= 0) {
+      throw new Error(`无效的 width ${effective.width}:必须是正整数(可在设置页的 Agnes 标签页调整默认值)。`)
     }
-    body.width = args.width
+    body.width = effective.width
   }
-  if (args.height !== undefined) {
-    if (!Number.isInteger(args.height) || args.height <= 0) {
-      throw new Error(`无效的 height ${args.height}:必须是正整数。`)
+  if (effective.height !== undefined) {
+    if (!Number.isInteger(effective.height) || effective.height <= 0) {
+      throw new Error(`无效的 height ${effective.height}:必须是正整数(可在设置页的 Agnes 标签页调整默认值)。`)
     }
-    body.height = args.height
+    body.height = effective.height
   }
-  if (args.num_frames !== undefined) {
-    if (!Number.isInteger(args.num_frames) || args.num_frames < 1 || args.num_frames > 441 || args.num_frames % 8 !== 1) {
-      throw new Error(`无效的 num_frames ${args.num_frames}:必须 ≤ 441 且满足 8n+1(如 81/121/241/441)。`)
+  if (effective.num_frames !== undefined) {
+    if (!Number.isInteger(effective.num_frames) || effective.num_frames < 1 || effective.num_frames > 441 || effective.num_frames % 8 !== 1) {
+      throw new Error(`无效的 num_frames ${effective.num_frames}:必须 ≤ 441 且满足 8n+1(如 81/121/241/441)。`)
     }
-    body.num_frames = args.num_frames
+    body.num_frames = effective.num_frames
   }
-  if (args.frame_rate !== undefined) {
-    if (args.frame_rate < 1 || args.frame_rate > 60) {
-      throw new Error(`无效的 frame_rate ${args.frame_rate}:支持范围为 1–60。`)
+  if (effective.frame_rate !== undefined) {
+    if (effective.frame_rate < 1 || effective.frame_rate > 60) {
+      throw new Error(`无效的 frame_rate ${effective.frame_rate}:支持范围为 1–60。`)
     }
-    body.frame_rate = args.frame_rate
+    body.frame_rate = effective.frame_rate
   }
-  if (args.seed !== undefined) body.seed = args.seed
-  if (typeof args.negative_prompt === 'string' && args.negative_prompt !== '') body.negative_prompt = args.negative_prompt
-  if (args.num_inference_steps !== undefined) {
-    if (!Number.isInteger(args.num_inference_steps) || args.num_inference_steps <= 0) {
-      throw new Error(`无效的 num_inference_steps ${args.num_inference_steps}:必须是正整数。`)
+  if (effective.seed !== undefined) body.seed = effective.seed
+  if (typeof effective.negative_prompt === 'string' && effective.negative_prompt !== '') body.negative_prompt = effective.negative_prompt
+  if (effective.num_inference_steps !== undefined) {
+    if (!Number.isInteger(effective.num_inference_steps) || effective.num_inference_steps <= 0) {
+      throw new Error(`无效的 num_inference_steps ${effective.num_inference_steps}:必须是正整数。`)
     }
-    body.num_inference_steps = args.num_inference_steps
+    body.num_inference_steps = effective.num_inference_steps
   }
-  const keyframes = Array.isArray(args.keyframes)
-    ? args.keyframes.filter((item): item is string => typeof item === 'string')
+  const keyframes = Array.isArray(effective.keyframes)
+    ? effective.keyframes.filter((item): item is string => typeof item === 'string')
     : []
-  const image = typeof args.image === 'string' && args.image !== '' ? args.image : undefined
+  const image = typeof effective.image === 'string' && effective.image !== '' ? effective.image : undefined
   if (keyframes.length > 0) {
     if (image !== undefined) {
       throw new Error('image 与 keyframes 不能同时使用:图生视频传单张 image,关键帧动画传 keyframes 数组。')
@@ -225,21 +256,26 @@ export function parseAgnesVideoQuery(jsonText: string): AgnesVideoValue {
 
 /**
  * 将规范化结果值渲染为面向模型的内容。
+ * 模型显示本次实际生效值(读自设置),而非硬编码常量。
  */
-export function renderAgnesVideoValue(args: AgnesVideoArgs, value: AgnesVideoValue): ContentBlock[] {
+export function renderAgnesVideoValue(args: AgnesVideoArgs, value: AgnesVideoValue, model: string): ContentBlock[] {
   const lines: string[] = []
   lines.push(`状态:${value.status ?? 'unknown'} | 进度:${value.progress ?? 0}%`)
   if (value.size !== undefined) lines.push(`分辨率:${value.size}`)
   if (value.seconds !== undefined) lines.push(`时长:${value.seconds} 秒`)
   if (value.url !== undefined) lines.push(`视频 URL:${value.url}`)
-  if (value.size_mapping !== null && typeof value.size_mapping === 'object' && typeof value.size_mapping.message === 'string') {
-    lines.push(`尺寸标准化:${value.size_mapping.message}`)
+  const sizeMapping = value.size_mapping
+  if (
+    sizeMapping !== null && typeof sizeMapping === 'object' && !Array.isArray(sizeMapping)
+    && typeof sizeMapping.message === 'string'
+  ) {
+    lines.push(`尺寸标准化:${sizeMapping.message}`)
   }
   if (value.status === 'failed') {
     const err = value.error
     lines.push(`任务失败:${typeof err === 'string' ? err : JSON.stringify(err ?? '(无错误详情)')}`)
   }
-  lines.push(`模型:${AGNES_VIDEO_MODEL} | video_id:${value.video_id ?? value.task_id ?? '未知'}`)
+  lines.push(`模型:${model} | video_id:${value.video_id ?? value.task_id ?? '未知'}`)
   return [{ type: 'text', text: lines.join('\n') }]
 }
 
@@ -310,14 +346,27 @@ async function pollAgnesVideo(shell: ShellExecutor, apiKey: string, videoId: str
   }
 }
 
+/** 工具描述;模型名不写入描述,避免设置改名后误导调用方。 */
+const TOOL_DESCRIPTION = [
+  '调用 Agnes Video API 生成视频,支持三种模式:文生视频(仅传 prompt)、图生视频(image 传单张公共 HTTPS 图片 URL)',
+  '和关键帧动画(keyframes 传两张以上公共 HTTPS 图片 URL,在关键帧之间生成平滑过渡)。',
+  '视频生成是异步任务,工具会先创建任务再轮询查询结果,完成后直接返回视频 URL(metadata.url);失败时返回 error 详情。',
+  '时长由 num_frames 与 frame_rate 控制(seconds = num_frames / frame_rate);num_frames 必须 ≤ 441 且满足 8n+1',
+  '(配合 frame_rate 24:81≈3 秒、121≈5 秒、241≈10 秒、441≈18 秒),frame_rate 支持 1–60。',
+  '宽高省略时使用用户设置的默认值;提交的尺寸会被 API 标准化到 480p/720p/1080p 档位,以返回的 size 与 metadata.size_mapping 为准。',
+  '提示词结构:文生视频 = 主体+动作+场景+镜头运动+光线+风格;图生视频 = 描述应运动与应保持稳定的元素;关键帧 = 描述关键帧之间的过渡关系。',
+  '设置 seed 可复现结果,negative_prompt 可排除不需要的内容。',
+].join('')
+
 /**
  * 在上下文中注册 `agnes_video_generate` 工具。
  * 注册挂载在调用插件的 fiber 上,随其一同移除。
+ * @param defaults 返回当前设置解析值的 thunk,每次执行与渲染时读取。
  */
-export function applyAgnesVideoTool(ctx: Context): void {
+export function applyAgnesVideoTool(ctx: Context, defaults: () => VideoDefaults): void {
   ctx.tools.register(defineTool({
     name: 'agnes_video_generate',
-    description: '调用 Agnes Video V2.0 API(模型 agnes-video-v2.0)生成视频,支持三种模式:文生视频(仅传 prompt)、图生视频(image 传单张公共 HTTPS 图片 URL)和关键帧动画(keyframes 传两张以上公共 HTTPS 图片 URL,在关键帧之间生成平滑过渡)。视频生成是异步任务,工具会先创建任务再轮询查询结果,完成后直接返回视频 URL(metadata.url);失败时返回 error 详情。时长由 num_frames 与 frame_rate 控制(seconds = num_frames / frame_rate);num_frames 必须 ≤ 441 且满足 8n+1(配合 frame_rate 24:81≈3 秒、121≈5 秒、241≈10 秒、441≈18 秒),frame_rate 支持 1–60。宽高默认 1152x768;提交的尺寸会被 API 标准化到 480p/720p/1080p 档位,以返回的 size 与 metadata.size_mapping 为准。提示词结构:文生视频 = 主体+动作+场景+镜头运动+光线+风格;图生视频 = 描述应运动与应保持稳定的元素;关键帧 = 描述关键帧之间的过渡关系。设置 seed 可复现结果,negative_prompt 可排除不需要的内容。',
+    description: TOOL_DESCRIPTION,
     parameters: {
       prompt: {
         type: 'string',
@@ -335,19 +384,19 @@ export function applyAgnesVideoTool(ctx: Context): void {
       },
       width: {
         type: 'integer',
-        description: '视频宽度,默认 1152;不支持的精确尺寸会被 API 标准化到 480p/720p/1080p 档位。',
+        description: '视频宽度,省略时用设置默认值;不支持的精确尺寸会被 API 标准化到 480p/720p/1080p 档位。',
       },
       height: {
         type: 'integer',
-        description: '视频高度,默认 768;不支持的精确尺寸会被 API 标准化到 480p/720p/1080p 档位。',
+        description: '视频高度,省略时用设置默认值;不支持的精确尺寸会被 API 标准化到 480p/720p/1080p 档位。',
       },
       num_frames: {
         type: 'integer',
-        description: '视频帧数,必须 ≤ 441 且满足 8n+1(如 81/121/241/441),默认 121;配合 frame_rate 24 时约 3/5/10/18 秒。',
+        description: '视频帧数,必须 ≤ 441 且满足 8n+1(如 81/121/241/441),省略时用设置默认值;配合 frame_rate 24 时约 3/5/10/18 秒。',
       },
       frame_rate: {
         type: 'number',
-        description: '视频帧率,支持 1–60,默认 24;更流畅的运动用 24 或 30。',
+        description: '视频帧率,支持 1–60,省略时用设置默认值;更流畅的运动用 24 或 30。',
       },
       seed: {
         type: 'integer',
@@ -378,7 +427,7 @@ export function applyAgnesVideoTool(ctx: Context): void {
         },
         additionalProperties: false,
       },
-      render: (args, value) => renderAgnesVideoValue(args, value),
+      render: (args, value) => renderAgnesVideoValue(args as AgnesVideoArgs, value, defaults().model),
     },
     timeoutMs: AGNES_VIDEO_TOOL_TIMEOUT_MS,
     // 仅读取外部 API,不修改父级拥有的状态。
@@ -388,19 +437,23 @@ export function applyAgnesVideoTool(ctx: Context): void {
       if (credentials === undefined) {
         throw new Error('凭据服务不可用:无法解析 AGNES_API_KEY。')
       }
-      const resolved = await credentials.resolve(credentialRef(AGNES_API_KEY_REF))
-      if (resolved === undefined) {
+      const resolvedKey = await credentials.resolve(credentialRef(AGNES_API_KEY_REF))
+      if (resolvedKey === undefined) {
         throw new Error('未配置 AGNES_API_KEY:请写入启动环境、$DSH_HOME/.credentials.yaml 或项目/user 的 .env,或在设置页的 Agnes 标签页中保存。')
       }
-      const body = buildAgnesVideoRequestBody(args)
+      const currentDefaults = defaults()
+      if (typeof currentDefaults.model !== 'string' || currentDefaults.model.trim() === '') {
+        throw new Error('视频模型名为空:请在设置页的 Agnes 标签页中填写 videoModel。')
+      }
+      const body = buildAgnesVideoRequestBody(args, currentDefaults)
       const shell = ctx.shell
       const createCommand = `curl -sS --max-time ${AGNES_VIDEO_CURL_TIMEOUT_S} -X POST ${AGNES_VIDEO_API_URL} -H "Authorization: Bearer $AGNES_API_KEY" -H "Content-Type: application/json" --data-binary @- -w '\\n__AGNES_STATUS__%{http_code}'`
-      const task = parseAgnesVideoTask(await runCurl(shell, resolved.value, createCommand, exec.signal, JSON.stringify(body)))
+      const task = parseAgnesVideoTask(await runCurl(shell, resolvedKey.value, createCommand, exec.signal, JSON.stringify(body)))
       const videoId = task.video_id ?? task.task_id ?? task.id
       if (videoId === undefined) {
         throw new Error(`Agnes API 未返回 video_id/task_id:${JSON.stringify(task)}`)
       }
-      return await pollAgnesVideo(shell, resolved.value, videoId, exec.signal)
+      return await pollAgnesVideo(shell, resolvedKey.value, videoId, exec.signal)
     },
   }))
 }

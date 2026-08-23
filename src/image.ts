@@ -1,6 +1,8 @@
 /**
  * `agnes_image_generate` 工具：通过 Agnes AI 图像 API 实现文生图、图生图和多图合成。
  * 请求体写入 curl 标准输入，密钥通过进程环境传递，均不进入命令行。
+ * 模型名称与默认 size/ratio 来自设置命名空间(设置页的 Agnes 标签页),不硬编码,
+ * 上游模型升级时改设置即可。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -13,8 +15,8 @@ import type {} from '@deepseek-ai/dsh-shell'
 /** Agnes 图像 API 端点。 */
 export const AGNES_API_URL = 'https://api.agnes-ai.cn/v1/images/generations'
 
-/** 图像生成模型。 */
-export const AGNES_MODEL = 'agnes-image-2.1-flash'
+/** 图像生成模型的文档默认值;仅作 schema 默认,实际模型始终读自设置。 */
+export const DEFAULT_IMAGE_MODEL = 'agnes-image-2.1-flash'
 
 /** 凭据引用。 */
 export const AGNES_API_KEY_REF = 'AGNES_API_KEY'
@@ -57,12 +59,24 @@ export interface AgnesImageArgs {
   return_base64?: boolean
 }
 
-/** 调用省略 `size`/`ratio` 时由设置命名空间提供的默认值。 */
+/** 调用时由设置命名空间解析出的默认值;模型名随上游升级在设置中修改。 */
 export interface AgnesDefaults {
+  /** 图像生成模型名称。 */
+  model: string
   /** 默认尺寸档位。 */
   defaultSize: string
   /** 默认宽高比。 */
   defaultRatio: string
+}
+
+/** 参数与默认值合并后的生效请求设置。 */
+export interface ResolvedImageSettings {
+  /** 实际使用的模型。 */
+  model: string
+  /** 实际使用的尺寸档位。 */
+  size: string
+  /** 实际使用的宽高比。 */
+  ratio: string
 }
 
 /** 工具规范化结果值，只含 API 实际返回的字段。 */
@@ -81,13 +95,24 @@ export interface AgnesImageValue {
 const IMAGE_PATTERN = /^(https?:\/\/|data:image\/)/
 
 /**
+ * 合并工具参数与设置默认值,得到本次调用的生效设置。
+ * 未提供或不在支持列表内的参数回退到设置值。
+ */
+export function resolveImageSettings(args: AgnesImageArgs, defaults: AgnesDefaults): ResolvedImageSettings {
+  return {
+    model: defaults.model,
+    size: args.size !== undefined && SIZE_TIERS_SET.has(args.size) ? args.size : defaults.defaultSize,
+    ratio: args.ratio !== undefined && RATIOS_SET.has(args.ratio) ? args.ratio : defaults.defaultRatio,
+  }
+}
+
+/**
  * 根据参数和默认值构建 API 请求体。
  */
 export function buildAgnesRequestBody(args: AgnesImageArgs, defaults: AgnesDefaults): Record<string, unknown> {
   const images = Array.isArray(args.image) ? args.image : []
   const wantBase64 = args.return_base64 === true
-  const size = args.size !== undefined && SIZE_TIERS_SET.has(args.size) ? args.size : defaults.defaultSize
-  const ratio = args.ratio !== undefined && RATIOS_SET.has(args.ratio) ? args.ratio : defaults.defaultRatio
+  const resolved = resolveImageSettings(args, defaults)
   const extra: Record<string, unknown> = { response_format: wantBase64 ? 'b64_json' : 'url' }
   if (images.length > 0) {
     for (const image of images) {
@@ -98,10 +123,10 @@ export function buildAgnesRequestBody(args: AgnesImageArgs, defaults: AgnesDefau
     extra.image = images
   }
   const body: Record<string, unknown> = {
-    model: AGNES_MODEL,
+    model: resolved.model,
     prompt: args.prompt,
-    size,
-    ratio,
+    size: resolved.size,
+    ratio: resolved.ratio,
     extra_body: extra,
   }
   if (images.length === 0 && wantBase64) body.return_base64 = true
@@ -149,24 +174,39 @@ export function parseAgnesResponse(jsonText: string): AgnesImageValue {
 
 /**
  * 将规范化结果值渲染为面向模型的内容。
+ * 模型与尺寸显示本次实际生效值(含设置回退),而非硬编码常量。
  */
-export function renderAgnesValue(args: AgnesImageArgs, value: AgnesImageValue): ContentBlock[] {
+export function renderAgnesValue(args: AgnesImageArgs, value: AgnesImageValue, defaults: AgnesDefaults): ContentBlock[] {
   const lines: string[] = []
   if (value.url !== undefined) lines.push(`生成结果 URL:${value.url}`)
   if (value.b64_json !== undefined) lines.push(`生成结果 Base64(${value.b64_json.length} 字符,字段 b64_json)`)
   if (value.revised_prompt !== undefined) lines.push(`修正后提示词:${value.revised_prompt}`)
-  lines.push(`模型:${AGNES_MODEL} | 尺寸:${args.size ?? '默认'} ${args.ratio ?? '默认'}`)
+  const resolved = resolveImageSettings(args, defaults)
+  lines.push(`模型:${resolved.model} | 尺寸:${resolved.size} ${resolved.ratio}`)
   return [{ type: 'text', text: lines.join('\n') }]
 }
+
+/** 工具描述;模型名不写入描述,避免设置改名后误导调用方。 */
+const TOOL_DESCRIPTION = [
+  '调用 Agnes AI 图像生成 API 进行文生图、图生图或多图合成。',
+  '文生图仅需 prompt(可加 size/ratio);图生图/多图合成需在 image 中传入一张或多张参考图',
+  '(公共 HTTPS URL 或 data:image/*;base64,... Data URI),并在 prompt 中描述变换或组合要求,尽量保留原始构图。',
+  'size 使用档位 1K/2K/3K/4K,ratio 支持 1:1、3:4、4:3、16:9、9:16、2:3、3:2、21:9;',
+  '不要传 1920x1080 这类精确尺寸(会被标准化)。省略 size/ratio 时使用用户设置的默认值。',
+  '默认返回图像 URL;设置 return_base64: true 时返回 b64_json。',
+  '推荐提示词结构:文生图 = 主体+场景+风格+光照+构图+质量;图生图 = 改变要求+新风格+添加/移除元素+保留元素;',
+  '多图合成 = 每张参考图的角色+目标场景+组合关系+风格/光照/构图。',
+].join('')
 
 /**
  * 在上下文中注册 `agnes_image_generate` 工具。
  * 注册挂载在调用插件的 fiber 上，随其一同移除。
+ * @param defaults 返回当前设置解析值的 thunk,每次执行与渲染时读取。
  */
 export function applyAgnesTool(ctx: Context, defaults: () => AgnesDefaults): void {
   ctx.tools.register(defineTool({
     name: 'agnes_image_generate',
-    description: '调用 Agnes AI 图像生成 API(模型 agnes-image-2.1-flash)进行文生图、图生图或多图合成。文生图仅需 prompt(可加 size/ratio);图生图/多图合成需在 image 中传入一张或多张参考图(公共 HTTPS URL 或 data:image/*;base64,... Data URI),并在 prompt 中描述变换或组合要求,尽量保留原始构图。size 使用档位 1K/2K/3K/4K,ratio 支持 1:1、3:4、4:3、16:9、9:16、2:3、3:2、21:9;不要传 1920x1080 这类精确尺寸(会被标准化)。默认返回图像 URL;设置 return_base64: true 时返回 b64_json。推荐提示词结构:文生图 = 主体+场景+风格+光照+构图+质量;图生图 = 改变要求+新风格+添加/移除元素+保留元素;多图合成 = 每张参考图的角色+目标场景+组合关系+风格/光照/构图。',
+    description: TOOL_DESCRIPTION,
     parameters: {
       prompt: {
         type: 'string',
@@ -176,12 +216,12 @@ export function applyAgnesTool(ctx: Context, defaults: () => AgnesDefaults): voi
       size: {
         type: 'string',
         enum: [...SIZE_TIERS],
-        description: '输出尺寸档位。1:1 时对应 1024/2048/3072/4096 边长,其他 ratio 按比例换算;需要 1920x1080/2560x1440 这类 16:9 素材时用 2K + 16:9 再裁剪。',
+        description: '输出尺寸档位。1:1 时对应 1024/2048/3072/4096 边长,其他 ratio 按比例换算;需要 1920x1080/2560x1440 这类 16:9 素材时用 2K + 16:9 再裁剪;省略时用设置默认值。',
       },
       ratio: {
         type: 'string',
         enum: [...RATIOS],
-        description: '与 size 档位配合的宽高比。',
+        description: '与 size 档位配合的宽高比;省略时用设置默认值。',
       },
       image: {
         type: 'array',
@@ -204,7 +244,7 @@ export function applyAgnesTool(ctx: Context, defaults: () => AgnesDefaults): voi
         },
         additionalProperties: false,
       },
-      render: (args, value) => renderAgnesValue(args, value),
+      render: (args, value) => renderAgnesValue(args as AgnesImageArgs, value, defaults()),
     },
     timeoutMs: AGNES_TOOL_TIMEOUT_MS,
     // 仅读取外部 API，不修改父级拥有的状态。
@@ -214,16 +254,20 @@ export function applyAgnesTool(ctx: Context, defaults: () => AgnesDefaults): voi
       if (credentials === undefined) {
         throw new Error('凭据服务不可用:无法解析 AGNES_API_KEY。')
       }
-      const resolved = await credentials.resolve(credentialRef(AGNES_API_KEY_REF))
-      if (resolved === undefined) {
+      const resolvedKey = await credentials.resolve(credentialRef(AGNES_API_KEY_REF))
+      if (resolvedKey === undefined) {
         throw new Error('未配置 AGNES_API_KEY:请写入启动环境、$DSH_HOME/.credentials.yaml 或项目/user 的 .env,或在设置页的 Agnes 标签页中保存。')
       }
-      const body = buildAgnesRequestBody(args, defaults())
+      const currentDefaults = defaults()
+      if (typeof currentDefaults.model !== 'string' || currentDefaults.model.trim() === '') {
+        throw new Error('图像模型名为空:请在设置页的 Agnes 标签页中填写 imageModel。')
+      }
+      const body = buildAgnesRequestBody(args, currentDefaults)
       const shell = ctx.shell
       const spec = shell.resolve({
         command: `curl -sS --max-time ${AGNES_CURL_TIMEOUT_S} -X POST ${AGNES_API_URL} -H "Authorization: Bearer $AGNES_API_KEY" -H "Content-Type: application/json" --data-binary @- -w '\\n__AGNES_STATUS__%{http_code}'`,
         stdin: JSON.stringify(body),
-        env: { [AGNES_API_KEY_REF]: resolved.value },
+        env: { [AGNES_API_KEY_REF]: resolvedKey.value },
         stdoutMaxBytes: AGNES_STDOUT_MAX_BYTES,
         timeoutMs: AGNES_TOOL_TIMEOUT_MS,
         signal: exec.signal,
