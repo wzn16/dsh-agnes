@@ -203,7 +203,7 @@ const TOOL_DESCRIPTION = [
  * 注册挂载在调用插件的 fiber 上，随其一同移除。
  * @param defaults 返回当前设置解析值的 thunk,每次执行与渲染时读取。
  */
-export function applyAgnesTool(ctx: Context, defaults: () => AgnesDefaults): void {
+export function applyAgnesImageTool(ctx: Context, defaults: () => AgnesDefaults): void {
   ctx.tools.register(defineTool({
     name: 'agnes_image_generate',
     description: TOOL_DESCRIPTION,

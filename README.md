@@ -5,7 +5,7 @@
 ## 功能
 
 - **图像生成**:`agnes_image_generate` 工具,通过 Agnes 图像 API 实现文生图、图生图(参考图)和多图合成。
-- **视频生成**:`agnes_video_generate` 工具,通过 Agnes 视频 API 实现文生视频、图生视频和关键帧动画(异步任务 + 轮询查询)。
+- **视频生成**:`agnes_video_generate` 工具,通过 Agnes 视频 API 实现文生视频、图生视频和关键帧动画(异步任务 + 轮询查询);按模型名自适应 V2.0 与 Video 2.5/2.5-flash 两代参数体系。
 - **设置面板**:设置页出现「Agnes」标签页,可调整图像/视频的默认参数与模型名称;修改无需重启即对后续工具调用生效。
 
 ## 安装
@@ -63,13 +63,15 @@ dsh plugin --profile <你的profile> add ./dsh-agnes-x.y.z.tgz
 
 | 分组 | 字段 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| 图像 | 图像模型名称 | `agnes-image-2.1-flash` | 工具实际调用的模型 |
-| 图像 | 默认尺寸档位 | `1K` | 调用省略 `size` 时使用 |
-| 图像 | 默认宽高比 | `1:1` | 调用省略 `ratio` 时使用 |
-| 视频 | 视频模型名称 | `agnes-video-v2.0` | 工具实际调用的模型 |
-| 视频 | 默认宽度 / 高度 | `1152` / `768` | 调用省略时使用;会被 API 标准化到 480p/720p/1080p 档位 |
-| 视频 | 默认帧数 | `121` | ≤441 且满足 8n+1;帧率 24 下约 5 秒 |
-| 视频 | 默认帧率 | `24` | 支持 1–60 |
+| 图像 | 图像模型名称 | `agnes-image-2.1-flash` | 工具实际调用的模型;输入框带 2.0/2.1 预设候选 |
+| 图像 | 默认尺寸档位 | `1K`(`1K · 日常生成`) | `1K`–`4K`;与比例组合的输出像素实时显示在页面上 |
+| 图像 | 默认宽高比 | `1:1`(方形) | 8 种比例均带场景标签(壁纸/头像/海报等) |
+| 视频 | 视频模型名称 | `agnes-video-v2.0` | 参数体系按模型名自适应:含 `2.5`(如 `agnes-video-2.5-flash`)走秒数制,其余走 V2.0 像素/帧数制;输入框带预设候选 |
+| 视频 | 画幅与清晰度 | `16:9 · 横版` + `720p · 高清`(提交 1280×720) | V2.0:预设映射到底层 width/height,API 再标准化到最近档;2.5 系列:提交 aspect_ratio + size(`720P`/`960P`/`2K`,flash 仅 720P)。非预设组合自动显示「自定义…」精确像素输入 |
+| 视频 | 视频时长 | V2.0:`约 5 秒(121 帧)`;2.5:`5 秒` | V2.0 用官方推荐帧数预设 81/121/241/441 + 自定义(8n+1);2.5 系列为整秒选择器(4–12) |
+| 视频 | 帧率(V2.0) | `24 · 电影感` | `24`/`30` 预设 + 自定义(1–60);时长提示随帧率联动;2.5 系列隐藏该行 |
+
+设置页 UI 只引用 DSH 官方主题令牌(`Theme.listTokens` 的别名集),派生色用 `color-mix`,根节点声明 `color-scheme: light dark`,明暗主题下原生控件与配色自动跟随,不携带浅色硬编码回退。
 
 ### 模型升级不硬编码
 
@@ -89,7 +91,13 @@ dsh plugin --profile <你的profile> add ./dsh-agnes-x.y.z.tgz
 ### agnes_video_generate
 
 - **模式**:文生视频(`prompt`)、图生视频(`image`)、关键帧动画(`keyframes`,至少两张)
-- **主要参数**:`prompt`、`image`、`keyframes`、`width`、`height`、`num_frames`(≤441 且遵循 8n+1 规则)、`frame_rate`(1–60)、`seed`、`negative_prompt`、`num_inference_steps`;省略几何/时长参数时使用设置默认值
+- **双参数体系自适应**:模型名含 `2.5`(如 `agnes-video-2.5` / `agnes-video-2.5-flash`)时自动切换到秒数制 OpenAI Videos 兼容体系——
+  - `seconds`:整数秒 4–12(默认读设置 `video25Seconds`;显式传 `num_frames`/`frame_rate` 时按「帧数 ÷ 帧率」四舍五入并夹取);
+  - `size`:`720P`/`960P`/`2K`(读设置 `video25Size`;**flash 仅支持 720P,其他值自动收敛**);
+  - `aspect_ratio`:由设置的 width/height 就近匹配白名单(21:9/16:9/4:3/1:1/3:4/9:16);
+  - 媒体映射:单张 `image` → `keyframe` 首帧;恰好两张 `keyframes` → `keyframe` 首尾帧;三张以上 → `reference` 的 `images`(flash 上限 5 张,超出报错);
+  - 查询统一附带 `model_name`;`width/height/num_frames/negative_prompt` 等 2.5 不接受的字段不会提交。
+- **主要参数(V2.0 系列)**:`width`、`height`、`num_frames`(≤441 且遵循 8n+1 规则)、`frame_rate`(1–60)、`seed`、`negative_prompt`、`num_inference_steps`;省略几何/时长参数时使用设置默认值
 - **模型**:读自设置的视频模型名称
 - 视频生成是异步任务,工具会创建任务后以 5 秒间隔轮询直到完成或失败。
 

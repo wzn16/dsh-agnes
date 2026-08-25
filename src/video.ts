@@ -38,6 +38,65 @@ export const AGNES_VIDEO_TOOL_TIMEOUT_MS = 900_000
 /** JSON 响应捕获上限。 */
 export const AGNES_VIDEO_STDOUT_MAX_BYTES = 32 * 1024 * 1024
 
+/** Video 2.5 系列支持的输出分辨率档位(docs/agnes-ai/Agnes Video 2.5.md)。 */
+export const VIDEO25_SIZES = ['720P', '960P', '2K'] as const
+
+/** Video 2.5 输出档位类型。 */
+export type Video25Size = (typeof VIDEO25_SIZES)[number]
+
+/** 2.5-flash 仅支持的档位;其他取值会被 API 以 400 拒绝,构建时直接收敛。 */
+export const VIDEO25_FLASH_ONLY_SIZE: Video25Size = '720P'
+
+/** 2.5 系列支持的时长范围(整数秒,提交为字符串)。 */
+export const VIDEO25_SECONDS_MIN = 4
+export const VIDEO25_SECONDS_MAX = 12
+
+/** 2.5-flash reference 模式的图片数量上限。 */
+export const VIDEO25_FLASH_REFERENCE_LIMIT = 5
+
+/** 2.5 系列画幅白名单及宽高比值;提交时就近匹配。 */
+const VIDEO25_ASPECT_TABLE: ReadonlyArray<{ ratio: string; value: number }> = [
+  { ratio: '21:9', value: 21 / 9 },
+  { ratio: '16:9', value: 16 / 9 },
+  { ratio: '4:3', value: 4 / 3 },
+  { ratio: '1:1', value: 1 },
+  { ratio: '3:4', value: 3 / 4 },
+  { ratio: '9:16', value: 9 / 16 },
+]
+
+/**
+ * 按模型名判断参数体系:名字含 "2.5"(如 agnes-video-2.5 / agnes-video-2.5-flash)
+ * 走秒数制 OpenAI Videos 兼容体系;其余走 V2.0 的 width/height/num_frames 体系。
+ */
+export function isVideo25Family(model: string): boolean {
+  return /2\.5/.test(model)
+}
+
+/**
+ * 把任意宽高就近匹配到 2.5 系列画幅白名单。
+ * 宽高不合法时回退 16:9(文档默认比例)。
+ */
+export function nearestAspect25(width: number | undefined, height: number | undefined): string {
+  const target = typeof width === 'number' && width > 0 && typeof height === 'number' && height > 0
+    ? width / height
+    : 16 / 9
+  let best = VIDEO25_ASPECT_TABLE[1]!
+  for (const row of VIDEO25_ASPECT_TABLE) {
+    if (Math.abs(row.value - target) < Math.abs(best.value - target)) best = row
+  }
+  return best.ratio
+}
+
+/**
+ * 帧数/帧率 → 2.5 系列整数秒:四舍五入后夹到 4–12。
+ * 帧率非法时按 24 兜底,帧数非法时按 121 兜底(≈5 秒)。
+ */
+export function secondsFromFrameTiming(numFrames: number | undefined, frameRate: number | undefined): number {
+  const fps = typeof frameRate === 'number' && Number.isFinite(frameRate) && frameRate > 0 ? frameRate : 24
+  const frames = typeof numFrames === 'number' && Number.isFinite(numFrames) && numFrames > 0 ? numFrames : 121
+  return Math.min(VIDEO25_SECONDS_MAX, Math.max(VIDEO25_SECONDS_MIN, Math.round(frames / fps)))
+}
+
 /** 工具参数:与 API 的请求字段一一对应。 */
 export interface AgnesVideoArgs {
   /** 视频内容的文本描述。 */
@@ -66,7 +125,7 @@ export interface AgnesVideoArgs {
 export interface VideoDefaults {
   /** 视频生成模型名称。 */
   model: string
-  /** 默认视频宽度。 */
+  /** 默认视频宽度(V2.0 体系;2.5 体系仅用作画幅来源)。 */
   width: number
   /** 默认视频高度。 */
   height: number
@@ -74,6 +133,10 @@ export interface VideoDefaults {
   numFrames: number
   /** 默认帧率(1–60)。 */
   frameRate: number
+  /** Video 2.5 系列默认时长(整数秒,4–12)。 */
+  seconds25: number
+  /** Video 2.5 系列输出分辨率档位。 */
+  size25: Video25Size
 }
 
 /** 创建任务响应中的关键字段。 */
@@ -128,10 +191,10 @@ function resolveWithDefaults(args: AgnesVideoArgs, defaults: VideoDefaults): Req
 }
 
 /**
- * 根据参数构建创建任务的 API 请求体。
+ * 根据参数构建 V2.0 体系创建任务的 API 请求体。
  * @throws 参数或设置默认值不合法时抛出面向模型的错误。
  */
-export function buildAgnesVideoRequestBody(args: AgnesVideoArgs, defaults: VideoDefaults): Record<string, unknown> {
+function buildAgnesVideoV2RequestBody(args: AgnesVideoArgs, defaults: VideoDefaults): Record<string, unknown> {
   const effective = resolveWithDefaults(args, defaults)
   const body: Record<string, unknown> = {
     model: defaults.model,
@@ -190,6 +253,96 @@ export function buildAgnesVideoRequestBody(args: AgnesVideoArgs, defaults: Video
     body.image = image
   }
   return body
+}
+
+/**
+ * 根据参数构建 Video 2.5 系列(含 2.5-flash)创建任务的 API 请求体。
+ *
+ * 2.5 是秒数制的 OpenAI Videos 兼容体系:mode(text/keyframe/reference)+
+ * seconds("4"–"12" 字符串)+ size(720P/960P/2K)+ aspect_ratio 白名单;
+ * 提交 width/height/num_frames/fps 等字段会被 API 以 400 拒绝,因此这里:
+ * - 调用方显式传了 num_frames/frame_rate 时换算为就近整秒,否则用设置的 video25Seconds;
+ * - aspect_ratio 由设置中的 width/height 就近匹配;
+ * - 工具的 image/keyframes 参数映射:keyframes 恰好两张 → keyframe 首尾帧,
+ *   单张 image → keyframe 首帧,三张以上 → reference/images;
+ * - flash 收敛:size 强制 720P、reference 图片 ≤5(超出直接报错而非静默截断)。
+ * @throws 参数不合法或超出 flash 限制时抛出面向模型的错误。
+ */
+export function buildAgnesVideo25RequestBody(args: AgnesVideoArgs, defaults: VideoDefaults): Record<string, unknown> {
+  const isFlash = /flash/i.test(defaults.model)
+  const size: Video25Size = isFlash
+    ? VIDEO25_FLASH_ONLY_SIZE
+    : (VIDEO25_SIZES as readonly string[]).includes(defaults.size25) ? defaults.size25 : '720P'
+
+  const effective = resolveWithDefaults(args, defaults)
+
+  const keyframes = Array.isArray(effective.keyframes)
+    ? effective.keyframes.filter((item): item is string => typeof item === 'string')
+    : []
+  const image = typeof effective.image === 'string' && effective.image !== '' ? effective.image : undefined
+  if (keyframes.length > 0 && image !== undefined) {
+    throw new Error('image 与 keyframes 不能同时使用:图生视频传单张 image,关键帧动画传 keyframes 数组。')
+  }
+  for (const url of [...keyframes, ...(image === undefined ? [] : [image])]) {
+    if (!VIDEO_IMAGE_PATTERN.test(url)) {
+      throw new Error(`无效的关键帧图片 "${url.slice(0, 64)}":必须是公共 HTTPS 图片 URL。`)
+    }
+  }
+
+  let mode: 'text' | 'keyframe' | 'reference'
+  const media: Record<string, unknown> = {}
+  if (keyframes.length >= 2) {
+    if (keyframes.length === 2) {
+      mode = 'keyframe'
+      media.first_frame = keyframes[0]
+      media.last_frame = keyframes[1]
+    } else {
+      mode = 'reference'
+      if (isFlash && keyframes.length > VIDEO25_FLASH_REFERENCE_LIMIT) {
+        throw new Error(`${defaults.model} 的 reference 图片最多 ${VIDEO25_FLASH_REFERENCE_LIMIT} 张,收到 ${keyframes.length} 张;请减少关键帧数量。`)
+      }
+      media.images = keyframes
+    }
+  } else if (image !== undefined) {
+    mode = 'keyframe'
+    media.first_frame = image
+  } else {
+    mode = 'text'
+  }
+
+  const explicitTiming = args.num_frames !== undefined || args.frame_rate !== undefined
+  const seconds = explicitTiming
+    ? secondsFromFrameTiming(effective.num_frames, effective.frame_rate)
+    : (Number.isInteger(defaults.seconds25)
+        && defaults.seconds25 >= VIDEO25_SECONDS_MIN && defaults.seconds25 <= VIDEO25_SECONDS_MAX
+        ? defaults.seconds25
+        : 5)
+
+  const body: Record<string, unknown> = {
+    model: defaults.model,
+    prompt: effective.prompt,
+    mode,
+    seconds: String(seconds),
+    size,
+    aspect_ratio: nearestAspect25(effective.width, effective.height),
+  }
+  Object.assign(body, media)
+  if (effective.seed !== undefined) {
+    if (!Number.isInteger(effective.seed)) {
+      throw new Error(`无效的 seed ${effective.seed}:必须是整数。`)
+    }
+    body.seed = effective.seed
+  }
+  return body
+}
+
+/**
+ * 构建创建任务请求体的统一入口:按设置中的模型名分发到对应参数体系。
+ */
+export function buildAgnesVideoRequestBody(args: AgnesVideoArgs, defaults: VideoDefaults): Record<string, unknown> {
+  return isVideo25Family(defaults.model)
+    ? buildAgnesVideo25RequestBody(args, defaults)
+    : buildAgnesVideoV2RequestBody(args, defaults)
 }
 
 /**
@@ -326,11 +479,13 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * 按 video_id 轮询查询结果,直到任务完成或失败。
+ * 查询统一附带 model_name:2.5 系列的 keyframe/reference 模式必须携带,
+ * V2.0 亦支持该参数,无副作用。
  * @throws 超过总预算或调用被取消时抛出面向模型的错误。
  */
-async function pollAgnesVideo(shell: ShellExecutor, apiKey: string, videoId: string, signal: AbortSignal): Promise<AgnesVideoValue> {
+async function pollAgnesVideo(shell: ShellExecutor, apiKey: string, videoId: string, model: string, signal: AbortSignal): Promise<AgnesVideoValue> {
   const deadline = Date.now() + AGNES_VIDEO_TOOL_TIMEOUT_MS
-  const queryCommand = `curl -sS --max-time ${AGNES_VIDEO_CURL_TIMEOUT_S} -G ${AGNES_VIDEO_QUERY_URL} --data-urlencode "video_id=${videoId}" -H "Authorization: Bearer $AGNES_API_KEY" -w '\\n__AGNES_STATUS__%{http_code}'`
+  const queryCommand = `curl -sS --max-time ${AGNES_VIDEO_CURL_TIMEOUT_S} -G ${AGNES_VIDEO_QUERY_URL} --data-urlencode "video_id=${videoId}" --data-urlencode "model_name=${model}" -H "Authorization: Bearer $AGNES_API_KEY" -w '\\n__AGNES_STATUS__%{http_code}'`
   let value: AgnesVideoValue
   for (;;) {
     if (signal.aborted) {
@@ -350,12 +505,13 @@ async function pollAgnesVideo(shell: ShellExecutor, apiKey: string, videoId: str
 const TOOL_DESCRIPTION = [
   '调用 Agnes Video API 生成视频,支持三种模式:文生视频(仅传 prompt)、图生视频(image 传单张公共 HTTPS 图片 URL)',
   '和关键帧动画(keyframes 传两张以上公共 HTTPS 图片 URL,在关键帧之间生成平滑过渡)。',
+  '参数体系按设置中的模型名自动适配:V2.0 系列用 width/height/num_frames/frame_rate(num_frames ≤441 且满足 8n+1,',
+  'frame_rate 24 时 81≈3 秒、121≈5 秒、241≈10 秒、441≈18 秒);2.5 系列(含 2.5-flash)自动换算为 seconds(4–12 整秒)、',
+  '分辨率档位与画幅白名单,并省略其不接受字段;2.5-flash 仅 720P 档、reference 图片最多 5 张。',
   '视频生成是异步任务,工具会先创建任务再轮询查询结果,完成后直接返回视频 URL(metadata.url);失败时返回 error 详情。',
-  '时长由 num_frames 与 frame_rate 控制(seconds = num_frames / frame_rate);num_frames 必须 ≤ 441 且满足 8n+1',
-  '(配合 frame_rate 24:81≈3 秒、121≈5 秒、241≈10 秒、441≈18 秒),frame_rate 支持 1–60。',
-  '宽高省略时使用用户设置的默认值;提交的尺寸会被 API 标准化到 480p/720p/1080p 档位,以返回的 size 与 metadata.size_mapping 为准。',
+  '宽高省略时使用用户设置的默认值;V2.0 提交的尺寸会被 API 标准化到 480p/720p/1080p 档位,以返回的 size 与 metadata.size_mapping 为准。',
   '提示词结构:文生视频 = 主体+动作+场景+镜头运动+光线+风格;图生视频 = 描述应运动与应保持稳定的元素;关键帧 = 描述关键帧之间的过渡关系。',
-  '设置 seed 可复现结果,negative_prompt 可排除不需要的内容。',
+  '设置 seed 可复现结果,negative_prompt 仅 V2.0 系列生效(2.5 系列不支持该字段)。',
 ].join('')
 
 /**
@@ -384,19 +540,19 @@ export function applyAgnesVideoTool(ctx: Context, defaults: () => VideoDefaults)
       },
       width: {
         type: 'integer',
-        description: '视频宽度,省略时用设置默认值;不支持的精确尺寸会被 API 标准化到 480p/720p/1080p 档位。',
+        description: '视频宽度,省略时用设置默认值;V2.0 系列会被 API 标准化到 480p/720p/1080p 档位,2.5 系列仅取其画幅比例。',
       },
       height: {
         type: 'integer',
-        description: '视频高度,省略时用设置默认值;不支持的精确尺寸会被 API 标准化到 480p/720p/1080p 档位。',
+        description: '视频高度,省略时用设置默认值;标准化行为同 width。',
       },
       num_frames: {
         type: 'integer',
-        description: '视频帧数,必须 ≤ 441 且满足 8n+1(如 81/121/241/441),省略时用设置默认值;配合 frame_rate 24 时约 3/5/10/18 秒。',
+        description: '视频帧数,V2.0 系列 ≤441 且满足 8n+1(如 81/121/241/441),省略时用设置默认值;2.5 系列换算为最接近的整秒(4–12)。',
       },
       frame_rate: {
         type: 'number',
-        description: '视频帧率,支持 1–60,省略时用设置默认值;更流畅的运动用 24 或 30。',
+        description: '视频帧率,V2.0 系列支持 1–60,省略时用设置默认值;更流畅的运动用 24 或 30;2.5 系列仅参与秒数换算。',
       },
       seed: {
         type: 'integer',
@@ -404,7 +560,7 @@ export function applyAgnesVideoTool(ctx: Context, defaults: () => VideoDefaults)
       },
       negative_prompt: {
         type: 'string',
-        description: '反向提示词,描述需要避免的内容。',
+        description: '反向提示词,描述需要避免的内容;仅 V2.0 系列支持,2.5 系列会忽略。',
       },
       num_inference_steps: {
         type: 'integer',
@@ -453,7 +609,7 @@ export function applyAgnesVideoTool(ctx: Context, defaults: () => VideoDefaults)
       if (videoId === undefined) {
         throw new Error(`Agnes API 未返回 video_id/task_id:${JSON.stringify(task)}`)
       }
-      return await pollAgnesVideo(shell, resolvedKey.value, videoId, exec.signal)
+      return await pollAgnesVideo(shell, resolvedKey.value, videoId, currentDefaults.model, exec.signal)
     },
   }))
 }

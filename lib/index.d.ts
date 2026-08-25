@@ -1,4 +1,5 @@
 import z from "@deepseek-ai/schemastery";
+import "@deepseek-ai/dsh-tools";
 import { Context } from "@deepseek-ai/cordis";
 import "@deepseek-ai/dsh-llm";
 //#region src/image.d.ts
@@ -6,6 +7,12 @@ import "@deepseek-ai/dsh-llm";
 declare const SIZE_TIERS: readonly ["1K", "2K", "3K", "4K"];
 /** 支持的宽高比。 */
 declare const RATIOS: readonly ["1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"];
+//#endregion
+//#region src/video.d.ts
+/** Video 2.5 系列支持的输出分辨率档位(docs/agnes-ai/Agnes Video 2.5.md)。 */
+declare const VIDEO25_SIZES: readonly ["720P", "960P", "2K"];
+/** Video 2.5 输出档位类型。 */
+type Video25Size = (typeof VIDEO25_SIZES)[number];
 //#endregion
 //#region src/index.d.ts
 declare const name = "dsh-agnes";
@@ -43,6 +50,10 @@ interface Config {
   videoNumFrames: number;
   /** 调用省略 `frame_rate` 时的默认帧率,支持 1–60。 */
   videoFrameRate: number;
+  /** Video 2.5 系列(含 flash)默认时长,整数秒 4–12。 */
+  video25Seconds: number;
+  /** Video 2.5 系列输出分辨率档位;flash 仅支持 720P(构建时自动收敛)。 */
+  video25Size: Video25Size;
 }
 /** schema 无法表达的跨字段约束(如 8n+1 帧数)统一在这里校验。@throws 不合法时抛出带字段名的错误。 */
 declare function assertConfig(config: Config): void;

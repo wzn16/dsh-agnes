@@ -2,8 +2,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 
-import { applyAgnesTool, DEFAULT_IMAGE_MODEL, RATIOS, SIZE_TIERS } from './image.ts'
-import { applyAgnesVideoTool, DEFAULT_VIDEO_MODEL } from './video.ts'
+import { applyAgnesImageTool, DEFAULT_IMAGE_MODEL, RATIOS, SIZE_TIERS } from './image.ts'
+import { applyAgnesVideoTool, DEFAULT_VIDEO_MODEL, VIDEO25_SIZES, type Video25Size } from './video.ts'
 export const name = 'dsh-agnes'
 
 /**
@@ -44,6 +44,10 @@ export interface Config {
   videoNumFrames: number
   /** 调用省略 `frame_rate` 时的默认帧率,支持 1–60。 */
   videoFrameRate: number
+  /** Video 2.5 系列(含 flash)默认时长,整数秒 4–12。 */
+  video25Seconds: number
+  /** Video 2.5 系列输出分辨率档位;flash 仅支持 720P(构建时自动收敛)。 */
+  video25Size: Video25Size
 }
 
 /** schema 无法表达的跨字段约束(如 8n+1 帧数)统一在这里校验。@throws 不合法时抛出带字段名的错误。 */
@@ -68,6 +72,13 @@ export function assertConfig(config: Config): void {
   if (!Number.isFinite(rate) || rate < 1 || rate > 60) {
     throw new Error(`videoFrameRate 必须在 1–60 之间,收到 ${rate}。`)
   }
+  const seconds25 = config.video25Seconds
+  if (!Number.isInteger(seconds25) || seconds25 < 4 || seconds25 > 12) {
+    throw new Error(`video25Seconds 必须是 4–12 的整数秒,收到 ${seconds25}。`)
+  }
+  if (!(VIDEO25_SIZES as readonly string[]).includes(config.video25Size)) {
+    throw new Error(`video25Size 必须是 ${VIDEO25_SIZES.join('/')} 之一,收到 ${config.video25Size}。`)
+  }
 }
 
 export const Config: z<Config> = z.object({
@@ -75,10 +86,12 @@ export const Config: z<Config> = z.object({
   defaultSize: z.union([...SIZE_TIERS]).default('1K').description('调用省略 size 时的默认尺寸档位'),
   defaultRatio: z.union([...RATIOS]).default('1:1').description('调用省略 ratio 时的默认宽高比'),
   videoModel: z.string().default(DEFAULT_VIDEO_MODEL).description('视频生成模型名称'),
-  videoWidth: z.number().min(1).max(8192).default(1152).description('调用省略 width 时的默认视频宽度'),
-  videoHeight: z.number().min(1).max(8192).default(768).description('调用省略 height 时的默认视频高度'),
+  videoWidth: z.number().min(1).max(8192).default(1280).description('调用省略 width 时的默认视频宽度(16:9 · 720p)'),
+  videoHeight: z.number().min(1).max(8192).default(720).description('调用省略 height 时的默认视频高度(16:9 · 720p)'),
   videoNumFrames: z.number().min(9).max(441).default(121).description('调用省略 num_frames 时的默认帧数,需满足 8n+1'),
   videoFrameRate: z.number().min(1).max(60).default(24).description('调用省略 frame_rate 时的默认帧率'),
+  video25Seconds: z.number().min(4).max(12).default(5).description('Video 2.5 系列默认时长(整数秒)'),
+  video25Size: z.union([...VIDEO25_SIZES]).default('720P').description('Video 2.5 系列输出分辨率档位;flash 仅支持 720P'),
 })
 
 /**
@@ -95,7 +108,7 @@ export function apply(ctx: Context, config: Config): void {
     // 拒绝 schema 表达不了的取值组合,让非法写入在保存时报错而非静默生效。
     validate: assertConfig,
   })
-  applyAgnesTool(ctx, () => {
+  applyAgnesImageTool(ctx, () => {
     const current = source()
     return { model: current.imageModel, defaultSize: current.defaultSize, defaultRatio: current.defaultRatio }
   })
@@ -107,6 +120,8 @@ export function apply(ctx: Context, config: Config): void {
       height: current.videoHeight,
       numFrames: current.videoNumFrames,
       frameRate: current.videoFrameRate,
+      seconds25: current.video25Seconds,
+      size25: current.video25Size,
     }
   })
 }
