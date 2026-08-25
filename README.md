@@ -6,7 +6,7 @@
 
 - **图像生成**:`agnes_image_generate` 工具,通过 Agnes 图像 API 实现文生图、图生图(参考图)和多图合成。
 - **视频生成**:`agnes_video_generate` 工具,通过 Agnes 视频 API 实现文生视频、图生视频和关键帧动画(异步任务 + 轮询查询);按模型名自适应 V2.0 与 Video 2.5/2.5-flash 两代参数体系。
-- **设置面板**:设置页出现「Agnes」标签页,可调整图像/视频的默认参数与模型名称;修改无需重启即对后续工具调用生效。
+- **设置面板**:设置页出现「Agnes」标签页,模型以下拉选择(目录对齐官方文档的三个接入模型),切换模型时其余默认值自适应;修改保存后落盘到 `~/.dsh/settings.yaml`,无需重启即对后续工具调用生效。
 
 ## 安装
 
@@ -57,27 +57,54 @@ dsh plugin --profile <你的profile> add ./dsh-agnes-x.y.z.tgz
 
 ## 设置页:「Agnes」标签页
 
-插件装载后,DSH 设置页会出现「Agnes」标签页(浏览器半侧由 `lib/client.js` 提供,经 `/plugins/dsh-agnes/client.js` 伺服)。可调整的默认参数:
+插件装载后,DSH 设置页会出现「Agnes」标签页(浏览器半侧由 `lib/client.js` 提供,经 `/plugins/dsh-agnes/client.js` 伺服)。
 
 > 注意:Host 只在扫描到 `dsh.client` 声明时才把浏览器半侧编入启动图,且扫描结果在进程内缓存。给已安装的旧版本追加浏览器半侧后,需要重启一次 web profile(`dsh web`)才能让标签页出现;全新安装则无需额外操作。
 
+**模型是下拉选择**,选项对齐 `docs/agnes-ai/` 的三个接入模型(目录见 `src/models.ts`,与浏览器半侧保持一致):
+
+- 图像:`agnes-image-2.1-flash`(Agnes Image 2.1 Flash)
+- 视频:`agnes-video-v2.0`(Agnes Video V2.0)、`agnes-video-2.5-flash`(Agnes Video 2.5 Flash)
+
+**默认配置自适应**:切换模型时,依赖字段自动暂存为该模型的推荐默认值(视频统一为 16:9 · 1280×720 · 约 5 秒),表单形态也随参数体系切换——V2.0 显示画幅像素/帧数/帧率,2.5 Flash 切换为整秒时长并把分辨率档位锁定为 720P(flash 上游唯一支持档);历史保存的其他档位在提交时由 Host 按 720P 收敛。自适应结果可继续微调后保存。
+
+可调整的默认参数:
+
 | 分组 | 字段 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| 图像 | 图像模型名称 | `agnes-image-2.1-flash` | 工具实际调用的模型;输入框带 2.0/2.1 预设候选 |
+| 图像 | 图像模型 | `agnes-image-2.1-flash` | 下拉选择;历史配置中的未知模型名会保留为「(当前)」选项 |
 | 图像 | 默认尺寸档位 | `1K`(`1K · 日常生成`) | `1K`–`4K`;与比例组合的输出像素实时显示在页面上 |
 | 图像 | 默认宽高比 | `1:1`(方形) | 8 种比例均带场景标签(壁纸/头像/海报等) |
-| 视频 | 视频模型名称 | `agnes-video-v2.0` | 参数体系按模型名自适应:含 `2.5`(如 `agnes-video-2.5-flash`)走秒数制,其余走 V2.0 像素/帧数制;输入框带预设候选 |
-| 视频 | 画幅与清晰度 | `16:9 · 横版` + `720p · 高清`(提交 1280×720) | V2.0:预设映射到底层 width/height,API 再标准化到最近档;2.5 系列:提交 aspect_ratio + size(`720P`/`960P`/`2K`,flash 仅 720P)。非预设组合自动显示「自定义…」精确像素输入 |
+| 视频 | 视频模型 | `agnes-video-v2.0` | 下拉选择;切换即自适应下方默认值与表单形态 |
+| 视频 | 画幅与清晰度 | `16:9 · 横版` + `720p · 高清`(提交 1280×720) | V2.0:预设映射到底层 width/height,API 再标准化到最近档;2.5 系列:提交 aspect_ratio + size(`720P`/`960P`/`2K`,flash 锁定 720P)。非预设组合自动显示「自定义…」精确像素输入 |
 | 视频 | 视频时长 | V2.0:`约 5 秒(121 帧)`;2.5:`5 秒` | V2.0 用官方推荐帧数预设 81/121/241/441 + 自定义(8n+1);2.5 系列为整秒选择器(4–12) |
 | 视频 | 帧率(V2.0) | `24 · 电影感` | `24`/`30` 预设 + 自定义(1–60);时长提示随帧率联动;2.5 系列隐藏该行 |
 
 设置页 UI 只引用 DSH 官方主题令牌(`Theme.listTokens` 的别名集),派生色用 `color-mix`,根节点声明 `color-scheme: light dark`,明暗主题下原生控件与配色自动跟随,不携带浅色硬编码回退。
 
-### 模型升级不硬编码
+### 配置落盘
 
-模型名称是自由字符串字段:Agnes 上游发布新版本(如 `agnes-image-3.x`)时,在设置页改个名字即可切换,无需更新或重建插件。文档当前值只作为 schema 默认值存在;工具描述里也不写死模型名,避免改名后误导调用方。设置保存经 revision 栅校验,非法取值(如帧数不满足 8n+1)会在保存时报错而不是静默生效。
+设置页的修改经 settings scope 写入 DSH 用户设置文档,**持久化到 `~/.dsh/settings.yaml` 的 `agnes:` 段**(DSH 标准设置文件;文件后端为原子写入):
 
-等价的持久化方式是在 profile 的插件行里写 `config`(组装层),或直接改用户设置文档;设置页的「重置」会清除覆盖、回到组装值/默认值。
+```yaml
+agnes:
+  imageModel: agnes-image-2.1-flash
+  defaultSize: 1K
+  defaultRatio: 1:1
+  videoModel: agnes-video-2.5-flash
+  videoWidth: 1280
+  videoHeight: 720
+  videoNumFrames: 121
+  videoFrameRate: 24
+  video25Seconds: 5
+  video25Size: 720P
+```
+
+只写用户改过的字段;未覆盖的字段回落到组装层 `config` 或 schema 默认值。设置保存经 revision 栅校验,非法取值(如帧数不满足 8n+1)会在保存时报错而不是静默生效。等价的持久化方式是在 profile 的插件行里写 `config`(组装层),或直接编辑该文件;设置页的「重置」会清除覆盖、回到组装值/默认值。
+
+### 目录之外的模型名
+
+Host 端按非空字符串校验模型名:历史配置里的旧名称(如 `agnes-video-2.5`)与未来上游新 ID 仍可解码运行,只是不在下拉列表中(显示为「(当前)」)。要让新模型进入下拉目录,更新插件版本即可;运行时参数体系本就按模型名自适应(名字含 `2.5` 走秒数制,含 `flash` 收敛 720P)。
 
 ## 工具说明
 
@@ -113,13 +140,13 @@ pnpm test           # 无依赖冒烟测试(服务端纯函数 + 客户端 bundl
 目录结构:
 
 ```
-├── src/                # TypeScript 源码(index/image/video)
+├── src/                # TypeScript 源码(index/image/video/models)
 ├── client/client.js    # 浏览器半侧源码(手写的惰性 CJS 工厂最终格式)
 ├── scripts/            # 构建辅助与冒烟测试
 ├── lib/                # 构建产物(git 忽略;npm 发布与运行时入口)
 ├── cordis.patch.yml    # dsh.bundle 配置层,按包名引用本包
 ├── tsdown.config.ts    # 构建配置(prepare 脚本复用,自包含)
-└── docs/               # DSH 插件开发文档(参考用)
+└── docs/               # Agnes AI 模型文档与 DSH 插件开发文档(参考用)
 ```
 
 本地联调:先 `pnpm build`,再把本目录作为本地依赖装入 profile:

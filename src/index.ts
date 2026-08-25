@@ -4,6 +4,11 @@ import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-sett
 
 import { applyAgnesImageTool, DEFAULT_IMAGE_MODEL, RATIOS, SIZE_TIERS } from './image.ts'
 import { applyAgnesVideoTool, DEFAULT_VIDEO_MODEL, VIDEO25_SIZES, type Video25Size } from './video.ts'
+import { IMAGE_MODEL_IDS, VIDEO_MODEL_IDS } from './models.ts'
+
+export { IMAGE_MODEL_CATALOG, IMAGE_MODEL_IDS, VIDEO_MODEL_CATALOG, VIDEO_MODEL_IDS } from './models.ts'
+export { imageModelPreset, videoModelPreset, type ImageModelPreset, type VideoModelPreset } from './models.ts'
+export type { AgnesModelOption } from './models.ts'
 export const name = 'dsh-agnes'
 
 /**
@@ -24,8 +29,10 @@ export type AgnesRatio = typeof RATIOS[number]
 
 /**
  * 插件配置。
- * 模型名称是自由字符串:上游升级版本(如 agnes-image-3.x)时,
- * 在设置页的 Agnes 标签页或 cordis.yml 中改名即可,无需改代码。
+ * 模型名称在设置页以下拉选择三个目录模型(docs/agnes-ai/):
+ * agnes-image-2.1-flash / agnes-video-v2.0 / agnes-video-2.5-flash。
+ * Host 端仍按非空自由字符串校验:历史配置里的旧名称(如 agnes-video-2.5)
+ * 与未来上游新 ID 仍可解码运行,只是不在下拉列表中;切换模型时依赖默认参数自适应。
  */
 export interface Config {
   /** 图像生成模型名称,调用省略时也作为工具实际使用的模型。 */
@@ -53,10 +60,10 @@ export interface Config {
 /** schema 无法表达的跨字段约束(如 8n+1 帧数)统一在这里校验。@throws 不合法时抛出带字段名的错误。 */
 export function assertConfig(config: Config): void {
   if (typeof config.imageModel !== 'string' || config.imageModel.trim() === '') {
-    throw new Error('imageModel 必须是非空字符串(当前文档值 agnes-image-2.1-flash)。')
+    throw new Error(`imageModel 必须是非空字符串,目录模型:${IMAGE_MODEL_IDS.join(' / ')}。`)
   }
   if (typeof config.videoModel !== 'string' || config.videoModel.trim() === '') {
-    throw new Error('videoModel 必须是非空字符串(当前文档值 agnes-video-v2.0)。')
+    throw new Error(`videoModel 必须是非空字符串,目录模型:${VIDEO_MODEL_IDS.join(' / ')}。`)
   }
   for (const key of ['videoWidth', 'videoHeight'] as const) {
     const value = config[key]
@@ -82,10 +89,10 @@ export function assertConfig(config: Config): void {
 }
 
 export const Config: z<Config> = z.object({
-  imageModel: z.string().default(DEFAULT_IMAGE_MODEL).description('图像生成模型名称'),
+  imageModel: z.string().default(DEFAULT_IMAGE_MODEL).description(`图像生成模型(下拉:${IMAGE_MODEL_IDS.join('/')})`),
   defaultSize: z.union([...SIZE_TIERS]).default('1K').description('调用省略 size 时的默认尺寸档位'),
   defaultRatio: z.union([...RATIOS]).default('1:1').description('调用省略 ratio 时的默认宽高比'),
-  videoModel: z.string().default(DEFAULT_VIDEO_MODEL).description('视频生成模型名称'),
+  videoModel: z.string().default(DEFAULT_VIDEO_MODEL).description(`视频生成模型(下拉:${VIDEO_MODEL_IDS.join('/')})`),
   videoWidth: z.number().min(1).max(8192).default(1280).description('调用省略 width 时的默认视频宽度(16:9 · 720p)'),
   videoHeight: z.number().min(1).max(8192).default(720).description('调用省略 height 时的默认视频高度(16:9 · 720p)'),
   videoNumFrames: z.number().min(9).max(441).default(121).description('调用省略 num_frames 时的默认帧数,需满足 8n+1'),

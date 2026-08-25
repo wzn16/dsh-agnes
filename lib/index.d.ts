@@ -14,6 +14,51 @@ declare const VIDEO25_SIZES: readonly ["720P", "960P", "2K"];
 /** Video 2.5 输出档位类型。 */
 type Video25Size = (typeof VIDEO25_SIZES)[number];
 //#endregion
+//#region src/models.d.ts
+/** 下拉列表中的一个模型条目。 */
+interface AgnesModelOption {
+  /** 提交给 API 的模型 ID。 */
+  id: string;
+  /** 设置页显示名。 */
+  label: string;
+}
+/** 支持的图像生成模型。 */
+declare const IMAGE_MODEL_CATALOG: readonly AgnesModelOption[];
+/** 支持的视频生成模型(下拉顺序即展示顺序)。 */
+declare const VIDEO_MODEL_CATALOG: readonly AgnesModelOption[];
+/** 图像模型 ID 集合,用于判断保存值是否在下拉目录内。 */
+declare const IMAGE_MODEL_IDS: readonly string[];
+/** 视频模型 ID 集合。 */
+declare const VIDEO_MODEL_IDS: readonly string[];
+/**
+ * 切换视频模型时,依赖字段自适应到的推荐默认值。
+ * 数值取自官方文档的大众场景:
+ * - V2.0「推荐参数」标准视频:121 帧 @ 24fps ≈ 5 秒;宽高给 720p/16:9 档位组合,
+ *   API 会标准化到最近的 480p/720p/1080p 档;
+ * - 2.5 系列:seconds 默认 "5"、size 仅 flash 固定 720P;宽高仅用于就近匹配画幅,
+ *   给 16:9 组合 1280×720。
+ */
+interface VideoModelPreset {
+  videoWidth: number;
+  videoHeight: number;
+  videoNumFrames: number;
+  videoFrameRate: number;
+  video25Seconds: number;
+  video25Size: Video25Size;
+}
+/** 视频模型 → 推荐默认参数;未知模型(自定义/未来上游)回退到同一组通用安全值。 */
+declare function videoModelPreset(_model: string): VideoModelPreset;
+/**
+ * 切换图像模型时,依赖字段自适应到的推荐默认值。
+ * 文档推荐用档位 + 比例获得可预期输出;1K/1:1 是日常生成的中性起点。
+ */
+interface ImageModelPreset {
+  defaultSize: '1K' | '2K' | '3K' | '4K';
+  defaultRatio: string;
+}
+/** 图像模型 → 推荐默认参数。 */
+declare function imageModelPreset(_model: string): ImageModelPreset;
+//#endregion
 //#region src/index.d.ts
 declare const name = "dsh-agnes";
 /**
@@ -30,8 +75,10 @@ type AgnesSizeTier = typeof SIZE_TIERS[number];
 type AgnesRatio = typeof RATIOS[number];
 /**
  * 插件配置。
- * 模型名称是自由字符串:上游升级版本(如 agnes-image-3.x)时,
- * 在设置页的 Agnes 标签页或 cordis.yml 中改名即可,无需改代码。
+ * 模型名称在设置页以下拉选择三个目录模型(docs/agnes-ai/):
+ * agnes-image-2.1-flash / agnes-video-v2.0 / agnes-video-2.5-flash。
+ * Host 端仍按非空自由字符串校验:历史配置里的旧名称(如 agnes-video-2.5)
+ * 与未来上游新 ID 仍可解码运行,只是不在下拉列表中;切换模型时依赖默认参数自适应。
  */
 interface Config {
   /** 图像生成模型名称,调用省略时也作为工具实际使用的模型。 */
@@ -65,4 +112,4 @@ declare const Config: z<Config>;
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { AGNES_SETTINGS_NAMESPACE, AgnesRatio, AgnesSizeTier, Config, apply, assertConfig, inject, name };
+export { AGNES_SETTINGS_NAMESPACE, type AgnesModelOption, AgnesRatio, AgnesSizeTier, Config, IMAGE_MODEL_CATALOG, IMAGE_MODEL_IDS, type ImageModelPreset, VIDEO_MODEL_CATALOG, VIDEO_MODEL_IDS, type VideoModelPreset, apply, assertConfig, imageModelPreset, inject, name, videoModelPreset };

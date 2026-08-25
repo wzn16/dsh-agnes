@@ -7,7 +7,12 @@
  *
  * 本页在设置页贡献一个 `settings.section` 条目(标签页「Agnes」),
  * 通过客户端 settings scope 绑定 Host 端注册的 `agnes` 设置命名空间,
- * 提供图像/视频生成默认参数(含模型名称)的暂存-保存-重置编辑流。
+ * 提供图像/视频生成默认参数的暂存-保存-重置编辑流。
+ *
+ * 模型选择是下拉框,选项对齐 docs/agnes-ai/ 官方文档的三个接入模型
+ * (与 Host 端 src/models.ts 目录一致);历史配置里的未知名称会作为
+ * 「(当前)」选项保留显示。切换模型时依赖字段自适应到该模型的推荐默认值,
+ * 并按参数体系切换表单形态(V2.0 像素/帧数制;2.5 系列秒数制,flash 锁定 720P)。
  *
  * 字段设计对齐 docs/agnes-ai/ 官方文档的大众场景:
  * - 图像:size 档位 + 比例带场景说明,并实时显示组合输出像素(文档尺寸表);
@@ -45,6 +50,29 @@
       var SIZE_OPTIONS = ['1K', '2K', '3K', '4K'];
       var RATIO_OPTIONS = ['1:1', '3:4', '4:3', '16:9', '9:16', '2:3', '3:2', '21:9'];
 
+      /** 模型下拉目录,与 Host 端 src/models.ts 保持一致(docs/agnes-ai/ 三个接入模型)。 */
+      var IMAGE_MODEL_CATALOG = [
+        { id: 'agnes-image-2.1-flash', label: 'Agnes Image 2.1 Flash' },
+      ];
+      var VIDEO_MODEL_CATALOG = [
+        { id: 'agnes-video-v2.0', label: 'Agnes Video V2.0' },
+        { id: 'agnes-video-2.5-flash', label: 'Agnes Video 2.5 Flash' },
+      ];
+
+      /**
+       * 切换模型时依赖字段自适应到的推荐默认值(与 src/models.ts 的 preset 一致)。
+       * 键为底层字段名,值为暂存文本;保存前经 FIELD_BY_NAME 校验。
+       */
+      var IMAGE_MODEL_PRESET = { defaultSize: '1K', defaultRatio: '1:1' };
+      var VIDEO_MODEL_PRESET = {
+        videoWidth: '1280',
+        videoHeight: '720',
+        videoNumFrames: '121',
+        videoFrameRate: '24',
+        video25Seconds: '5',
+        video25Size: '720P',
+      };
+
       /** 图像尺寸档位 × 比例的输出像素表(docs/agnes-ai/Agnes Image 2.1 Flash.md)。 */
       var IMAGE_PIXELS = {
         '1:1': { '1K': '1024×1024', '2K': '2048×2048', '3K': '3072×3072', '4K': '4096×4096' },
@@ -77,20 +105,24 @@
       // ---- 文案(zh 为键集来源,en 对照补全) ----
       var zh = {
         title: 'Agnes',
-        lede: 'Agnes AI 图像与视频生成工具的默认参数。模型随上游版本升级时在此改名即可,无需更新插件。',
+        lede: 'Agnes AI 图像与视频生成工具的默认参数。模型从下拉列表选择,切换时其余默认值自动适配;保存后写入 DSH 设置文档(~/.dsh/settings.yaml 的 agnes 段),即时生效。',
         groupImage: '图像生成默认值',
         groupVideo: '视频生成默认值',
-        imageModel: '图像模型名称',
-        imageModelHint: '实际调用的模型;升级版本(如 agnes-image-3.x)时改成新名称即可。',
+        imageModel: '图像模型',
+        imageModelHint: '下拉选择目录模型;实际调用的模型随选择写入配置。',
+        adaptedNotice: '已按所选模型自适应下方默认参数,可继续微调后保存。',
         defaultSize: '默认尺寸档位',
         defaultSizeHint: '调用省略 size 时使用;搭配下方比例决定输出像素。',
         defaultRatio: '默认宽高比',
         defaultRatioHint: '与尺寸档位配合;需要常见 16:9 显示素材时选 2K + 16:9 后再裁剪。',
-        videoModel: '视频模型名称',
-        videoModelHint: '参数体系按模型名自动适配:V2.0 用画幅像素与帧数;2.5 系列(含 flash)用秒数与分辨率档位。',
+        videoModel: '视频模型',
+        videoModelHint: '下拉选择目录模型;参数体系按模型自适应:V2.0 用画幅像素与帧数,2.5 Flash 用秒数与分辨率档位(仅 720P)。',
+        currentOptionSuffix: '(当前)',
         videoCanvas: '画幅与清晰度',
         videoCanvasHint: '以画幅 × 档位提交宽高,API 会标准化到最近的 480p/720p/1080p 档。',
         videoCanvasHint25: '以画幅 + 档位提交;flash 仅支持 720P,其他档位会自动按 720P 提交。',
+        videoCanvasHint25Flash: '以画幅 + 档位提交;flash 仅支持 720P,档位已锁定。',
+        flashSizeNote: '已保存的档位 {v} 不被 flash 支持,提交时将按 720P 收敛。',
         videoDuration: '视频时长',
         videoDurationHint: '时长 = 帧数 ÷ 帧率;帧数需 ≤441 且满足 8n+1。',
         videoDuration25: '视频时长',
@@ -158,20 +190,24 @@
       };
       var en = {
         title: 'Agnes',
-        lede: 'Defaults for the Agnes AI image & video generation tools. Point model names at newer upstream versions without touching code.',
+        lede: 'Defaults for the Agnes AI image & video generation tools. Pick models from the dropdowns — remaining defaults adapt automatically; saving persists to the DSH settings document (the "agnes" section of ~/.dsh/settings.yaml) and applies immediately.',
         groupImage: 'Image defaults',
         groupVideo: 'Video defaults',
         imageModel: 'Image model',
-        imageModelHint: 'The model actually called; rename it (e.g. agnes-image-3.x) when upstream upgrades.',
+        imageModelHint: 'Choose a catalog model; the model actually called follows the selection.',
+        adaptedNotice: 'Defaults below were adapted to the selected model; fine-tune before saving.',
+        currentOptionSuffix: '(current)',
         defaultSize: 'Default size tier',
         defaultSizeHint: 'Used when a call omits size; paired with the ratio below to decide output pixels.',
         defaultRatio: 'Default aspect ratio',
         defaultRatioHint: 'Paired with the size tier; pick 2K + 16:9 for desktop material, then crop.',
         videoModel: 'Video model',
-        videoModelHint: 'Parameters adapt to the model name: V2.0 uses pixel canvas and frames; the 2.5 family (incl. flash) uses seconds and quality tiers.',
+        videoModelHint: 'Choose a catalog model; parameters adapt per model: V2.0 uses pixel canvas and frames, 2.5 Flash uses seconds and quality tiers (720P only).',
         videoCanvas: 'Canvas & quality',
         videoCanvasHint: 'Width/height are submitted from canvas × tier; the API normalizes to the nearest 480p/720p/1080p preset.',
         videoCanvasHint25: 'Submitted as aspect ratio + tier; flash only supports 720P — other tiers are coerced to 720P.',
+        videoCanvasHint25Flash: 'Submitted as aspect ratio + tier; flash only supports 720P, so the tier is locked.',
+        flashSizeNote: 'Saved tier {v} is not supported by flash and will be coerced to 720P on submit.',
         videoDuration: 'Duration',
         videoDurationHint: 'duration = frames ÷ fps; frames must be ≤441 and follow 8n+1.',
         videoDuration25: 'Duration',
@@ -622,16 +658,27 @@
         var hintText = function (key) {
           return h('div', { className: 'dsh-agnes-hint' }, t(key));
         };
-        var selectEl = function (value, options, onChange, key) {
+        var selectEl = function (value, options, onChange, key, opts) {
+          var o = opts || {};
           return h('select', {
             key: key,
             className: 'dsh-agnes-select',
             value: value,
-            disabled: !writable,
+            disabled: !writable || o.disabled === true,
             onChange: function (e) { onChange(e.target.value); },
           }, options.map(function (opt) {
             return h('option', { key: opt.value, value: opt.value }, opt.label);
           }));
+        };
+        /** 模型下拉选项:目录模型优先;不在目录内的已存值保留为「(当前)」选项。 */
+        var modelOptions = function (catalog, current) {
+          var options = catalog.map(function (m) {
+            return { value: m.id, label: m.label };
+          });
+          if (current !== undefined && current !== '' && !catalog.some(function (m) { return m.id === current; })) {
+            options.push({ value: current, label: current + t('currentOptionSuffix') });
+          }
+          return options;
         };
         var numberInput = function (field, opts) {
           var o = opts || {};
@@ -657,6 +704,16 @@
         };
 
         // ---- 图像组 ----
+        var imgModelVal = textValue('imageModel');
+        // 切换模型 → 模型名 + 推荐默认参数一起暂存,保存前可继续微调。
+        var onImageModelChange = function (v) {
+          stage('imageModel', v);
+          var preset = IMAGE_MODEL_PRESET;
+          stageMany(Object.keys(preset).map(function (field) { return [field, preset[field]]; }));
+        };
+        var imageAdapted = hasDraft(['imageModel'])
+          && Object.keys(IMAGE_MODEL_PRESET).some(function (f) { return drafts[f] !== undefined; });
+
         var imageSizeOptions = SIZE_OPTIONS.map(function (s) {
           return { value: s, label: t('size' + s) };
         });
@@ -677,19 +734,11 @@
           h('div', { className: 'dsh-agnes-card-head' }, h(IconImage, { size: 14 }), t('groupImage')),
           h('div', { className: 'dsh-agnes-field' },
             fieldHead('imageModel', ['imageModel'], function () { return { imageModel: snapshot.base ? snapshot.base.imageModel : undefined }; }),
-            h('input', {
-              className: 'dsh-agnes-input',
-              type: 'text',
-              value: textValue('imageModel'),
-              list: 'dsh-agnes-image-models',
-              placeholder: 'agnes-image-2.1-flash',
-              spellCheck: false,
-              disabled: !writable,
-              onChange: function (e) { stage('imageModel', e.target.value); },
-            }),
-            h('datalist', { id: 'dsh-agnes-image-models' },
-              h('option', { value: 'agnes-image-2.1-flash' }),
-              h('option', { value: 'agnes-image-2.0-flash' })),
+            selectEl(
+              imgModelVal === '' ? IMAGE_MODEL_CATALOG[0].id : imgModelVal,
+              modelOptions(IMAGE_MODEL_CATALOG, imgModelVal),
+              onImageModelChange, 'im'),
+            imageAdapted ? h('div', { className: 'dsh-agnes-hint' }, t('adaptedNotice')) : null,
             hintText('imageModelHint')),
           h('div', { className: 'dsh-agnes-field' },
             fieldHead('defaultSize', ['defaultSize'], function () { return { defaultSize: snapshot.base ? snapshot.base.defaultSize : undefined }; }),
@@ -705,8 +754,18 @@
 
         // ---- 视频组 ----
         // 参数体系按模型名自适应:含 "2.5"(如 agnes-video-2.5 / 2.5-flash)走秒数制。
-        var is25 = /2\.5/.test(textValue('videoModel'));
-        var isFlash = /flash/i.test(textValue('videoModel'));
+        // 注意 textValue 含草稿:下拉切换后表单形态立即跟随新模型。
+        var vidModelVal = textValue('videoModel');
+        var is25 = /2\.5/.test(vidModelVal);
+        var isFlash = /flash/i.test(vidModelVal);
+        // 切换模型 → 模型名 + 推荐默认参数一起暂存(flash 的 720P 约束也在此收敛)。
+        var onVideoModelChange = function (v) {
+          stage('videoModel', v);
+          var preset = VIDEO_MODEL_PRESET;
+          stageMany(Object.keys(preset).map(function (field) { return [field, preset[field]]; }));
+        };
+        var videoAdapted = hasDraft(['videoModel'])
+          && Object.keys(VIDEO_MODEL_PRESET).some(function (f) { return drafts[f] !== undefined; });
         var curW = numericValue('videoWidth');
         var curH = numericValue('videoHeight');
         var matched = canvasLookup(curW, curH);
@@ -726,7 +785,10 @@
         var commitW = matched ? VIDEO_CANVAS[curTier][curRatio][0] : curW;
         var commitH = matched ? VIDEO_CANVAS[curTier][curRatio][1] : curH;
         var size25Raw = textValue('video25Size');
-        var size25 = VIDEO25_SIZES.indexOf(size25Raw) >= 0 ? size25Raw : '720P';
+        var size25Stored = VIDEO25_SIZES.indexOf(size25Raw) >= 0 ? size25Raw : '720P';
+        // flash 锁定 720P:显示值强制 720P;历史保存的其他档位在提交时由 Host 收敛。
+        var size25 = isFlash ? '720P' : size25Stored;
+        var flashSizeMismatch = isFlash && size25Stored !== '720P';
         var secondsRaw = numericValue('video25Seconds');
         var seconds25Value = typeof secondsRaw === 'number' && secondsRaw >= 4 && secondsRaw <= 12 ? secondsRaw : 5;
 
@@ -762,7 +824,12 @@
               canvasRatioOptions.concat([{ value: 'custom', label: t('customOption') }]),
               function (r) { if (r !== 'custom') applyCanvas(r, curTier); }, 'vr'),
             is25
-              ? selectEl(size25, canvasTierOptions, function (v) { stage('video25Size', v); }, 'vt')
+              ? selectEl(size25,
+                  isFlash
+                    ? [{ value: '720P', label: t('tier25720P') }]
+                    : canvasTierOptions,
+                  function (v) { stage('video25Size', v); }, 'vt',
+                  isFlash ? { disabled: true } : undefined)
               : selectEl(matched ? matched.tier : 'custom',
                   canvasTierOptions.concat([{ value: 'custom', label: t('customOption') }]),
                   function (tier) { if (tier !== 'custom') applyCanvas(curRatio, tier); }, 'vt')),
@@ -770,7 +837,8 @@
             numberInput('videoWidth', { ph: '1280', min: 1, step: 1, labelKey: 'videoWidth' }),
             numberInput('videoHeight', { ph: '720', min: 1, step: 1, labelKey: 'videoHeight' })),
           h('div', { className: 'dsh-agnes-hint' },
-            t(is25 ? 'videoCanvasHint25' : 'videoCanvasHint'),
+            t(isFlash ? 'videoCanvasHint25Flash' : (is25 ? 'videoCanvasHint25' : 'videoCanvasHint')),
+            flashSizeMismatch ? ' ' + t('flashSizeNote').replace('{v}', size25Stored) : null,
             is25
               ? ' · ' + t('commitAspect')
                   .replace('{ratio}', curRatio)
@@ -819,20 +887,11 @@
           h('div', { className: 'dsh-agnes-card-head' }, h(IconFilm, { size: 14 }), t('groupVideo')),
           h('div', { className: 'dsh-agnes-field' },
             fieldHead('videoModel', ['videoModel'], function () { return { videoModel: snapshot.base ? snapshot.base.videoModel : undefined }; }),
-            h('input', {
-              className: 'dsh-agnes-input',
-              type: 'text',
-              value: textValue('videoModel'),
-              list: 'dsh-agnes-video-models',
-              placeholder: 'agnes-video-v2.0',
-              spellCheck: false,
-              disabled: !writable,
-              onChange: function (e) { stage('videoModel', e.target.value); },
-            }),
-            h('datalist', { id: 'dsh-agnes-video-models' },
-              h('option', { value: 'agnes-video-v2.0' }),
-              h('option', { value: 'agnes-video-2.5-flash' }),
-              h('option', { value: 'agnes-video-2.5' })),
+            selectEl(
+              vidModelVal === '' ? VIDEO_MODEL_CATALOG[0].id : vidModelVal,
+              modelOptions(VIDEO_MODEL_CATALOG, vidModelVal),
+              onVideoModelChange, 'vm'),
+            videoAdapted ? h('div', { className: 'dsh-agnes-hint' }, t('adaptedNotice')) : null,
             hintText('videoModelHint')),
           canvasRow,
           durationRow,

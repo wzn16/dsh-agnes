@@ -13,6 +13,29 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const { buildAgnesRequestBody } = await import(join(root, 'src/image.ts'))
 const { buildAgnesVideoRequestBody } = await import(join(root, 'src/video.ts'))
 const { assertConfig, Config } = await import(join(root, 'src/index.ts'))
+const {
+  IMAGE_MODEL_CATALOG, IMAGE_MODEL_IDS,
+  VIDEO_MODEL_CATALOG, VIDEO_MODEL_IDS,
+  imageModelPreset, videoModelPreset,
+} = await import(join(root, 'src/models.ts'))
+
+// 模型目录:三个文档模型的单一事实来源
+assert.deepEqual(IMAGE_MODEL_IDS, ['agnes-image-2.1-flash'])
+assert.deepEqual(VIDEO_MODEL_IDS, ['agnes-video-v2.0', 'agnes-video-2.5-flash'])
+assert.equal(VIDEO_MODEL_CATALOG.every((m) => m.label && m.label.length > 0), true)
+assert.equal(IMAGE_MODEL_CATALOG.every((m) => m.label && m.label.length > 0), true)
+// 各模型推荐默认参数必须能通过整份配置校验(设置页自适应写入的就是这些值)
+const presetOf = (videoModel) => ({
+  imageModel: IMAGE_MODEL_IDS[0], defaultSize: '1K', defaultRatio: '1:1',
+  videoModel,
+  videoWidth: 1280, videoHeight: 720, videoNumFrames: 121, videoFrameRate: 24,
+  video25Seconds: 5, video25Size: '720P',
+})
+for (const videoModel of VIDEO_MODEL_IDS) {
+  const preset = videoModelPreset(videoModel)
+  assert.doesNotThrow(() => assertConfig({ ...presetOf(videoModel), ...preset }))
+}
+assert.doesNotThrow(() => assertConfig({ ...presetOf(IMAGE_MODEL_IDS[0]), ...imageModelPreset(IMAGE_MODEL_IDS[0]) }))
 
 // 模型来自设置而非硬编码
 const imageDefaults = { model: 'agnes-image-9.9-beta', defaultSize: '2K', defaultRatio: '16:9' }
@@ -211,8 +234,47 @@ function countTypes(node, type, acc = { n: 0, sel: 0 }) {
   for (const c of [].concat(node.props?.children ?? [])) countTypes(c, type, acc)
   return acc
 }
+function collectSelects(node, acc = []) {
+  if (!node || typeof node !== 'object') return acc
+  if (node.type === 'select') acc.push(node)
+  for (const c of [].concat(node.children ?? [])) collectSelects(c, acc)
+  for (const c of [].concat(node.props?.children ?? [])) collectSelects(c, acc)
+  return acc
+}
+function collectTexts(node, acc = []) {
+  if (typeof node === 'string') { acc.push(node); return acc }
+  if (node === null || node === undefined || typeof node !== 'object') return acc
+  for (const c of [].concat(node.children ?? [])) collectTexts(c, acc)
+  for (const c of [].concat(node.props?.children ?? [])) collectTexts(c, acc)
+  return acc
+}
+function optionValues(sel) {
+  // 仿真元素把 children 放在顶层;真实 React 在 props.children。两处都收并拍平。
+  return [].concat(sel.props?.children ?? [], sel.children ?? [])
+    .flat(Infinity)
+    .filter((o) => o !== null && typeof o === 'object' && o.type === 'option')
+    .map((o) => o.props.value)
+}
 let presetScan = countTypes(el)
 assert.ok(presetScan.n === 0, `预设路径不应有数字输入,实际 ${presetScan.n}`)
+
+// 模型字段是下拉选择:目录模型为选项;未知已存值保留为「(当前)」选项
+function collectInputs(node, acc = []) {
+  if (!node || typeof node !== 'object') return acc
+  if (node.type === 'input') acc.push(node)
+  for (const c of [].concat(node.children ?? [])) collectInputs(c, acc)
+  for (const c of [].concat(node.props?.children ?? [])) collectInputs(c, acc)
+  return acc
+}
+assert.equal(collectInputs(el).some((i) => i.props.type === 'text'), false, '模型不再使用自由文本输入')
+const selectsPreset = collectSelects(el)
+const imgModelSel = selectsPreset.find((s) => optionValues(s).includes('agnes-image-2.1-flash'))
+assert.ok(imgModelSel, '图像模型应为含目录 ID 的下拉框')
+const vidModelSel = selectsPreset.find((s) => optionValues(s).includes('agnes-video-v2.0'))
+assert.ok(vidModelSel, '视频模型应为含目录 ID 的下拉框')
+assert.deepEqual(optionValues(vidModelSel), ['agnes-video-v2.0', 'agnes-video-2.5-flash', 'm-vid'], '未知已存值保留为当前选项')
+assert.equal(imgModelSel.props.value, 'm-img')
+assert.equal(vidModelSel.props.value, 'm-vid')
 
 // 自定义路径:旧默认 1152×768 不在画幅表 → 显示精确宽高输入
 currentSnap = {
@@ -229,6 +291,29 @@ currentSnap = {
   value: { ...currentSnap.value, videoWidth: 1280, videoHeight: 720 },
 }
 el = registered.comp({}, null)
+assert.equal(collectSelects(el).length, 8, 'V2.0 路径应有 8 个下拉框(图像 3 + 视频 5)')
+
+// flash 场景:2.5 系列隐藏帧率行;档位锁定单选 720P(禁用),历史非 720P 档位给出收敛提示
+currentSnap = {
+  ...currentSnap,
+  value: {
+    ...currentSnap.value,
+    videoModel: 'agnes-video-2.5-flash',
+    video25Seconds: 5,
+    video25Size: '960P',
+  },
+}
+el = registered.comp({}, null)
+let flashScan = countTypes(el)
+assert.equal(flashScan.n, 0, 'flash 路径不应有数字输入')
+const flashSelects = collectSelects(el)
+assert.equal(flashSelects.length, 7, 'flash 路径应比 V2.0 路径少一个帧率下拉框')
+const tierSel = flashSelects.find((s) => optionValues(s).length === 1 && optionValues(s)[0] === '720P')
+assert.ok(tierSel, 'flash 档位应锁定为单选 720P')
+assert.equal(tierSel.props.disabled, true, 'flash 档位下拉应禁用')
+assert.equal(tierSel.props.value, '720P', 'flash 档位显示值强制 720P')
+const flashText = collectTexts(el).join('')
+assert.ok(flashText.includes('960P'), '历史保存的 960P 档位应出现在收敛提示里')
 
 // 只读态横幅
 currentSnap = { ...currentSnap, writable: false }

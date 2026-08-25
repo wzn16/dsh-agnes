@@ -1,7 +1,7 @@
 {
   "name": "dsh-agnes",
   "description": "Agnes AI image & video generation tools for DSH (agnes_image_generate / agnes_video_generate)",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
