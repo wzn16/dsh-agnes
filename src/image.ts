@@ -1,7 +1,7 @@
 /**
  * `agnes_image_generate` 工具：通过 Agnes AI 图像 API 实现文生图、图生图和多图合成。
- * 请求体写入 curl 标准输入，密钥通过进程环境传递，均不进入命令行。
- * 模型名称与默认 size/ratio 来自设置命名空间(设置页的 Agnes 标签页),不硬编码,
+ * 请求经 node 原生 fetch 直连 API(0.2.x 起不再经宿主 shell+curl)。
+ * 模型名称与默认 size/ratio 来自插件配置(设置页的 Agnes 标签页),不硬编码,
  * 上游模型升级时改设置即可。
  */
 
@@ -9,14 +9,13 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-// 仅用于类型：引入 shell 的 Context 合并。
-import type {} from '@deepseek-ai/dsh-shell'
-
-/** Agnes 图像 API 端点。 */
-export const AGNES_API_URL = 'https://api.agnes-ai.cn/v1/images/generations'
+import { apiEndpoint, postJson } from './http.ts'
 
 /** 图像生成模型的文档默认值;仅作 schema 默认,实际模型始终读自设置。 */
 export const DEFAULT_IMAGE_MODEL = 'agnes-image-2.1-flash'
+
+/** 图像生成 API 路径(主机按 apiSite 站点解析)。 */
+export const IMAGE_API_PATH = '/v1/images/generations'
 
 /** 凭据引用。 */
 export const AGNES_API_KEY_REF = 'AGNES_API_KEY'
@@ -36,14 +35,11 @@ const RATIOS_SET: ReadonlySet<string> = new Set(RATIOS)
 /** 工具调用的协作式超时预算；API 可能需要几十秒。 */
 export const AGNES_TOOL_TIMEOUT_MS = 360_000
 
-/** curl 网络超时。 */
-export const AGNES_CURL_TIMEOUT_S = 300
+/** 网络超时(秒)。 */
+export const AGNES_HTTP_TIMEOUT_S = 300
 
 /** JSON 响应捕获上限。 */
 export const AGNES_STDOUT_MAX_BYTES = 32 * 1024 * 1024
-
-/** curl 的 `-w` 标记行，用于携带 HTTP 状态码。 */
-export const AGNES_STATUS_MARKER = '\n__AGNES_STATUS__'
 
 /** 已验证的工具参数。 */
 export interface AgnesImageArgs {
@@ -59,7 +55,7 @@ export interface AgnesImageArgs {
   return_base64?: boolean
 }
 
-/** 调用时由设置命名空间解析出的默认值;模型名随上游升级在设置中修改。 */
+/** 调用时由插件配置解析出的默认值;模型名随上游升级在设置中修改。 */
 export interface AgnesDefaults {
   /** 图像生成模型名称。 */
   model: string
@@ -67,6 +63,8 @@ export interface AgnesDefaults {
   defaultSize: string
   /** 默认宽高比。 */
   defaultRatio: string
+  /** 当前 API 站点。 */
+  apiSite: string
 }
 
 /** 参数与默认值合并后的生效请求设置。 */
@@ -131,17 +129,6 @@ export function buildAgnesRequestBody(args: AgnesImageArgs, defaults: AgnesDefau
   }
   if (images.length === 0 && wantBase64) body.return_base64 = true
   return body
-}
-
-/**
- * 将 curl 标准输出拆分为响应体和末尾状态码。
- * 标记含原始换行符，而 JSON 不含，故拆分无歧义。
- */
-export function splitAgnesStatus(stdout: string): { jsonText: string; status: number | null } {
-  const markerIndex = stdout.lastIndexOf(AGNES_STATUS_MARKER)
-  if (markerIndex === -1) return { jsonText: stdout, status: null }
-  const status = Number(stdout.slice(markerIndex + AGNES_STATUS_MARKER.length).trim())
-  return { jsonText: stdout.slice(0, markerIndex), status: Number.isFinite(status) ? status : null }
 }
 
 /**
@@ -263,30 +250,24 @@ export function applyAgnesImageTool(ctx: Context, defaults: () => AgnesDefaults)
         throw new Error('图像模型名为空:请在设置页的 Agnes 标签页中填写 imageModel。')
       }
       const body = buildAgnesRequestBody(args, currentDefaults)
-      const shell = ctx.shell
-      const spec = shell.resolve({
-        command: `curl -sS --max-time ${AGNES_CURL_TIMEOUT_S} -X POST ${AGNES_API_URL} -H "Authorization: Bearer $AGNES_API_KEY" -H "Content-Type: application/json" --data-binary @- -w '\\n__AGNES_STATUS__%{http_code}'`,
-        stdin: JSON.stringify(body),
-        env: { [AGNES_API_KEY_REF]: resolvedKey.value },
-        stdoutMaxBytes: AGNES_STDOUT_MAX_BYTES,
-        timeoutMs: AGNES_TOOL_TIMEOUT_MS,
-        signal: exec.signal,
-      })
-      const result = await shell.run(spec)
+      const result = await postJson(
+        apiEndpoint(currentDefaults.apiSite, IMAGE_API_PATH),
+        resolvedKey.value,
+        JSON.stringify(body),
+        AGNES_HTTP_TIMEOUT_S * 1000,
+        exec.signal,
+        AGNES_STDOUT_MAX_BYTES,
+      )
       if (result.timedOut || result.aborted) {
-        throw new Error(`图像生成请求${result.timedOut ? '超时' : '被取消'}(${result.timeoutMs}ms),请稍后重试或降低 size 档位。`)
+        throw new Error(`图像生成请求${result.timedOut ? '超时' : '被取消'}(${AGNES_HTTP_TIMEOUT_S}s),请稍后重试或降低 size 档位。`)
       }
-      if (result.exitCode !== 0) {
-        throw new Error(`Agnes API 请求失败(exit ${result.exitCode}):${result.stderr.text.slice(0, 500)}`)
+      if (!result.ok) {
+        throw new Error(`Agnes API 返回 HTTP ${result.status}:${result.text.slice(0, 800)}`)
       }
-      if (result.stdout.truncated) {
+      if (result.truncated) {
         throw new Error('Agnes API 响应过大,超出捕获上限;请使用 URL 输出(默认)或改用更小的 size 档位。')
       }
-      const { jsonText, status } = splitAgnesStatus(result.stdout.text)
-      if (status !== null && (status < 200 || status >= 300)) {
-        throw new Error(`Agnes API 返回 HTTP ${status}:${jsonText.slice(0, 800)}`)
-      }
-      return parseAgnesResponse(jsonText)
+      return parseAgnesResponse(result.text)
     },
   }))
 }

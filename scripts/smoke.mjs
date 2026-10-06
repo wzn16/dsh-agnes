@@ -26,6 +26,7 @@ assert.equal(VIDEO_MODEL_CATALOG.every((m) => m.label && m.label.length > 0), tr
 assert.equal(IMAGE_MODEL_CATALOG.every((m) => m.label && m.label.length > 0), true)
 // 各模型推荐默认参数必须能通过整份配置校验(设置页自适应写入的就是这些值)
 const presetOf = (videoModel) => ({
+  apiSite: 'china',
   imageModel: IMAGE_MODEL_IDS[0], defaultSize: '1K', defaultRatio: '1:1',
   videoModel,
   videoWidth: 1280, videoHeight: 720, videoNumFrames: 121, videoFrameRate: 24,
@@ -110,11 +111,13 @@ assert.equal(body.aspect_ratio, '9:16')
 
 // assertConfig:插件加载与设置写入共用的校验
 const validConfig = {
+  apiSite: 'china',
   imageModel: 'agnes-image-2.1-flash', defaultSize: '1K', defaultRatio: '1:1',
   videoModel: 'agnes-video-v2.0', videoWidth: 1280, videoHeight: 720, videoNumFrames: 121, videoFrameRate: 24,
   video25Seconds: 5, video25Size: '720P',
 }
 assert.doesNotThrow(() => assertConfig(validConfig))
+assert.throws(() => assertConfig({ ...validConfig, apiSite: 'jp' }), /apiSite/)
 assert.throws(() => assertConfig({ ...validConfig, imageModel: '' }), /imageModel/)
 assert.throws(() => assertConfig({ ...validConfig, videoNumFrames: 120 }), /8n\+1/)
 assert.throws(() => assertConfig({ ...validConfig, videoWidth: 0 }), /videoWidth/)
@@ -154,36 +157,41 @@ const fakeReact = {
   useCallback: (fn) => fn,
   useRef: (v) => ({ current: v }),
   useEffect: () => {},
-  useSyncExternalStore: (_subscribe, get) => get(),
+  useSyncExternalStore: (subscribe, get) => { subscribe(() => {}); return get() },
 }
 
 let currentSnap = {
-  status: 'ready', writable: true, revision: 7,
+  status: 'ready', writable: true,
   value: {
     imageModel: 'm-img', defaultSize: '1K', defaultRatio: '1:1',
     videoModel: 'm-vid', videoWidth: 1280, videoHeight: 720, videoNumFrames: 121, videoFrameRate: 24,
   },
-  base: null, user: null,
+  base: {}, user: {},
 }
-// 与真实 SettingsScopeController 同形:依赖 this 的类方法。
-// 若客户端再把方法作裸引用传给 useSyncExternalStore,这里会像浏览器一样抛错。
-class FakeScope {
-  subscribe(listener) { if (this === undefined) throw new TypeError('subscribe 丢失 this'); return () => {} }
-  getSnapshot() { if (this === undefined) throw new TypeError('getSnapshot 丢失 this'); return currentSnap }
-  set(field, value) { if (this === undefined) throw new TypeError('set 丢失 this'); return Promise.resolve() }
-  unset(field) { if (this === undefined) throw new TypeError('unset 丢失 this'); return Promise.resolve() }
+// 0.2.x 起客户端数据层走自建 /dsh-agnes/config 路由:stub fetch 供 rpc 调用。
+let mutateCalls = []
+globalThis.fetch = async (url, opts) => {
+  const u = String(url)
+  if (u.endsWith('/dsh-agnes/config/status')) {
+    return { ok: true, json: async () => ({ ok: true, data: currentSnap }) }
+  }
+  if (u.endsWith('/dsh-agnes/config/mutate')) {
+    mutateCalls.push(JSON.parse((opts && opts.body) || '{}').ops)
+    return { ok: true, json: async () => ({ ok: true, data: currentSnap }) }
+  }
+  return { ok: false, status: 404, json: async () => ({ ok: false, error: { message: 'not found' } }) }
 }
-const binder = {
-  bind(spec) {
-    assert.deepEqual(spec, { namespace: 'agnes' })
-    return new FakeScope()
-  },
+const tick = () => new Promise((r) => setImmediate(r))
+// 渲染一次触发 scope.subscribe → refresh;等微任务落地后再渲染读取就绪快照。
+async function renderSettled() {
+  registered.comp({}, null)
+  await tick()
+  return registered.comp({}, null)
 }
 let registered = null
 let injectFn = null
 const ctx = {
   effect() {},
-  inject(_services, cb) { cb({ get(n) { return n === 'webUiSettings' ? undefined : binder }, settingsScope: binder }) },
   locale: {
     register(ns, dicts) {
       assert.equal(ns, 'agnes')
@@ -204,7 +212,7 @@ const ctx = {
 
 const clientExports = factory((name) => { assert.equal(name, 'react'); return fakeReact })
 assert.equal(typeof clientExports.apply, 'function')
-assert.deepEqual(clientExports.inject, ['slots', 'locale', 'settingsScope'])
+assert.deepEqual(clientExports.inject, ['slots', 'locale'])
 clientExports.apply(ctx)
 assert.equal(typeof injectFn, 'function', 'slots.inject 回调应存在')
 const disposer = injectFn()
@@ -215,7 +223,7 @@ assert.equal(typeof registered.opts.label(), 'string')
 assert.equal(typeof disposer, 'function')
 
 // ready 态渲染:header + 两组卡片 + 页脚
-let el = registered.comp({}, null)
+let el = await renderSettled()
 let kids = el.children.flat().filter(Boolean)
 assert.ok(kids.length >= 3, `ready 态应有 header/卡片/页脚,实际 ${kids.length}`)
 const cards = kids.filter((k) => k && k.props && String(k.props.className || '').includes('dsh-agnes-card'))
@@ -281,7 +289,7 @@ currentSnap = {
   ...currentSnap,
   value: { ...currentSnap.value, videoWidth: 1152, videoHeight: 768 },
 }
-el = registered.comp({}, null)
+el = await renderSettled()
 let customScan = countTypes(el)
 assert.ok(customScan.n >= 2, `自定义路径应出现宽/高数字输入,实际 ${customScan.n}`)
 
@@ -290,7 +298,7 @@ currentSnap = {
   ...currentSnap,
   value: { ...currentSnap.value, videoWidth: 1280, videoHeight: 720 },
 }
-el = registered.comp({}, null)
+el = await renderSettled()
 assert.equal(collectSelects(el).length, 8, 'V2.0 路径应有 8 个下拉框(图像 3 + 视频 5)')
 
 // flash 场景:2.5 系列隐藏帧率行;档位锁定单选 720P(禁用),历史非 720P 档位给出收敛提示
@@ -303,7 +311,7 @@ currentSnap = {
     video25Size: '960P',
   },
 }
-el = registered.comp({}, null)
+el = await renderSettled()
 let flashScan = countTypes(el)
 assert.equal(flashScan.n, 0, 'flash 路径不应有数字输入')
 const flashSelects = collectSelects(el)
@@ -317,13 +325,13 @@ assert.ok(flashText.includes('960P'), '历史保存的 960P 档位应出现在�
 
 // 只读态横幅
 currentSnap = { ...currentSnap, writable: false }
-el = registered.comp({}, null)
+el = await renderSettled()
 kids = el.children.flat().filter(Boolean)
 assert.ok(kids.some((k) => k && k.props && String(k.props.className || '').includes('banner-warn')), '只读态应有横幅')
 
 // 加载态
-currentSnap = { status: 'loading', value: undefined, base: undefined, user: undefined, revision: undefined, writable: false }
-el = registered.comp({}, null)
+currentSnap = { status: 'loading', value: undefined, base: undefined, user: undefined, writable: false }
+el = await renderSettled()
 assert.equal(el.children.filter(Boolean).length, 1, 'loading 态只有一个横幅')
 
 console.log('client smoke OK')

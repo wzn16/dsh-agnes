@@ -1,6 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import type { ApiSite } from './http.ts'
 
 import { applyAgnesImageTool, DEFAULT_IMAGE_MODEL, RATIOS, SIZE_TIERS } from './image.ts'
 import { applyAgnesVideoTool, DEFAULT_VIDEO_MODEL, VIDEO25_SIZES, type Video25Size } from './video.ts'
@@ -12,14 +15,10 @@ export type { AgnesModelOption } from './models.ts'
 export const name = 'dsh-agnes'
 
 /**
- * 插件注册工具前需等待 tools 服务就绪;
- * 工具执行经属性访问(ctx.shell)使用 shell 服务发起 curl,必须在 inject 中声明,
- * 否则运行时报 `cannot get property "shell" without inject`。
+ * 插件注册工具前需等待 tools 服务就绪(0.2.x 起 HTTP 请求走 node 原生 fetch,
+ * 不再依赖 shell 服务)。
  */
-export const inject = ['tools', 'shell'] as const
-
-/** 设置命名空间；浏览器端会再次声明。 */
-export const AGNES_SETTINGS_NAMESPACE = settingsNamespace('agnes')
+export const inject = ['tools'] as const
 
 /** 支持的尺寸档位。 */
 export type AgnesSizeTier = typeof SIZE_TIERS[number]
@@ -55,6 +54,8 @@ export interface Config {
   video25Seconds: number
   /** Video 2.5 系列输出分辨率档位;flash 仅支持 720P(构建时自动收敛)。 */
   video25Size: Video25Size
+  /** API 站点:china=国内站,international=国际站。 */
+  apiSite: ApiSite
 }
 
 /** schema 无法表达的跨字段约束(如 8n+1 帧数)统一在这里校验。@throws 不合法时抛出带字段名的错误。 */
@@ -86,6 +87,9 @@ export function assertConfig(config: Config): void {
   if (!(VIDEO25_SIZES as readonly string[]).includes(config.video25Size)) {
     throw new Error(`video25Size 必须是 ${VIDEO25_SIZES.join('/')} 之一,收到 ${config.video25Size}。`)
   }
+  if (config.apiSite !== 'china' && config.apiSite !== 'international') {
+    throw new Error(`apiSite 必须是 china/international 之一,收到 ${config.apiSite}。`)
+  }
 }
 
 export const Config: z<Config> = z.object({
@@ -99,25 +103,92 @@ export const Config: z<Config> = z.object({
   videoFrameRate: z.number().min(1).max(60).default(24).description('调用省略 frame_rate 时的默认帧率'),
   video25Seconds: z.number().min(4).max(12).default(5).description('Video 2.5 系列默认时长(整数秒)'),
   video25Size: z.union([...VIDEO25_SIZES]).default('720P').description('Video 2.5 系列输出分辨率档位;flash 仅支持 720P'),
+  apiSite: z.union(['china', 'international']).default('china').description('API 站点:china=国内站(默认),international=国际站(apihub)'),
 })
 
+// ===================== 设置存储（0.2.x 自建路由 + 覆盖文件） =====================
+// 0.1.x 的 installSettingsSection/settingsNamespace 已在 0.2.x 移除。
+// 参照 dsh-task-capsule 的成熟模式:插件自管覆盖文件 + webServer 前缀路由,
+// 设置页(客户端半侧)经 /dsh-agnes/config/status|mutate 读写。
+
+/** 用户覆盖层落盘位置(~/.dsh/dsh-agnes.json)。 */
+const USER_STORE_PATH = path.join(os.homedir(), '.dsh', 'dsh-agnes.json')
+
+/** 允许写入覆盖层的字段白名单(与 Config 一一对应)。 */
+const CONFIG_KEYS = [
+  'apiSite',
+  'imageModel', 'defaultSize', 'defaultRatio',
+  'videoModel', 'videoWidth', 'videoHeight',
+  'videoNumFrames', 'videoFrameRate', 'video25Seconds', 'video25Size',
+] as const
+
+/** 读取用户覆盖层;文件缺失/损坏时返回空对象(回落 patch config 与 schema 默认值)。 */
+function readUserLayer(): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(USER_STORE_PATH, 'utf8'))
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
+  } catch { /* 缺失或坏文件都按无覆盖处理 */ }
+  return {}
+}
+
+/** 原子写覆盖层(临时文件 + rename)。 */
+function writeUserLayer(user: Record<string, unknown>): void {
+  fs.mkdirSync(path.dirname(USER_STORE_PATH), { recursive: true })
+  const tmp = `${USER_STORE_PATH}.tmp-${process.pid}`
+  fs.writeFileSync(tmp, JSON.stringify(user, null, 2) + '\n')
+  fs.renameSync(tmp, USER_STORE_PATH)
+}
+
+/** 组装设置页快照:base(patch config/默认) + user(覆盖) → value(生效值)。 */
+function buildSnapshot(base: Config) {
+  const user = readUserLayer()
+  const value = { ...base, ...user } as Config
+  assertConfig(value)
+  return { status: 'ready', writable: true, base, user, value }
+}
+
+/** 读取请求体(JSON);空体返回 {}。 */
+function readBody(req: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    req.on('data', (c: Buffer) => chunks.push(c))
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      if (!text) return resolve({})
+      try { resolve(JSON.parse(text)) } catch (e) { reject(new Error('请求体不是合法 JSON')) }
+    })
+    req.on('error', reject)
+  })
+}
+
+/** 输出 JSON 响应。 */
+function sendJson(res: any, status: number, body: unknown): void {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(body))
+}
+
 /**
- * 注册工具并连接设置命名空间。
- * 每次调用读取命名空间的解析值，因此设置修改无需重启即可生效；
- * 模型名称与默认参数同样来自该命名空间，不硬编码在工具内。
+ * 注册工具(0.2.x 起:插件 config schema 由宿主 SettingsForms 直接投影为设置表单,
+ * 不再需要 0.1.x 的 installSettingsSection;config 变更经 cordis 语义重新 apply,
+ * 因此工具始终读取当前 config,修改默认参数无需重启即生效)。
+ * 设置页数据经自建路由读写用户覆盖层,同样即时生效。
  */
 export function apply(ctx: Context, config: Config): void {
   assertConfig(config)
-  let source = () => config
-  installSettingsSection(ctx, AGNES_SETTINGS_NAMESPACE, Config, config, {
-    setSource: (current) => { source = current },
-    onChange: () => {},
-    // 拒绝 schema 表达不了的取值组合,让非法写入在保存时报错而非静默生效。
-    validate: assertConfig,
-  })
+  const source = () => {
+    try {
+      const merged = { ...config, ...readUserLayer() } as Config
+      assertConfig(merged)
+      return merged
+    } catch {
+      return config
+    }
+  }
   applyAgnesImageTool(ctx, () => {
     const current = source()
-    return { model: current.imageModel, defaultSize: current.defaultSize, defaultRatio: current.defaultRatio }
+    return { model: current.imageModel, defaultSize: current.defaultSize, defaultRatio: current.defaultRatio, apiSite: current.apiSite }
   })
   applyAgnesVideoTool(ctx, () => {
     const current = source()
@@ -129,6 +200,57 @@ export function apply(ctx: Context, config: Config): void {
       frameRate: current.videoFrameRate,
       seconds25: current.video25Seconds,
       size25: current.video25Size,
+      apiSite: current.apiSite,
     }
+  })
+
+  // 设置页数据路由:status 读快照,mutate 应用 set/unset 操作后落盘并返回新快照。
+  ctx.inject(['webServer'], (wsCtx: any) => {
+    wsCtx.effect(() => wsCtx.webServer.register({
+      kind: 'prefix',
+      path: '/dsh-agnes/config',
+      async handler(req: any, res: any) {
+        try {
+          const url = new URL(req.url || '/', 'http://dsh.internal')
+          const method = url.pathname.replace(/^\/dsh-agnes\/config\/?/, '').split('/')[0] || ''
+          if (method === 'status') {
+            return sendJson(res, 200, { ok: true, data: buildSnapshot(config) })
+          }
+          if (method === 'mutate') {
+            const payload = await readBody(req)
+            const ops = Array.isArray(payload && payload.ops) ? payload.ops : []
+            const user = readUserLayer()
+            for (const op of ops as any[]) {
+              if (!op || typeof op !== 'object') continue
+              if (op.op !== 'set' && op.op !== 'unset') continue
+              if (typeof op.field !== 'string' || !(CONFIG_KEYS as readonly string[]).includes(op.field)) continue
+              if (op.op === 'set') user[op.field] = op.value
+              else delete user[op.field]
+            }
+            const merged = { ...config, ...user } as Config
+            try {
+              assertConfig(merged)
+            } catch (e) {
+              // 非法组合不落盘,让错误在保存时就暴露而非静默生效。
+              return sendJson(res, 400, {
+                ok: false,
+                error: { code: 'invalid-config', message: (e as Error).message },
+              })
+            }
+            writeUserLayer(user)
+            return sendJson(res, 200, { ok: true, data: buildSnapshot(config) })
+          }
+          return sendJson(res, 404, {
+            ok: false,
+            error: { code: 'method-not-found', message: 'unknown method: ' + method },
+          })
+        } catch (e) {
+          return sendJson(res, 500, {
+            ok: false,
+            error: { code: 'internal', message: (e as Error).message },
+          })
+        }
+      },
+    }), 'dsh-agnes: /dsh-agnes/config HTTP route')
   })
 }

@@ -2,6 +2,10 @@ import z from "@deepseek-ai/schemastery";
 import "@deepseek-ai/dsh-tools";
 import { Context } from "@deepseek-ai/cordis";
 import "@deepseek-ai/dsh-llm";
+//#region src/http.d.ts
+/** API 站点:china=国内站,international=国际站。 */
+type ApiSite = 'china' | 'international';
+//#endregion
 //#region src/image.d.ts
 /** 支持的尺寸档位；不支持的精确尺寸由 API 标准化。 */
 declare const SIZE_TIERS: readonly ["1K", "2K", "3K", "4K"];
@@ -62,13 +66,10 @@ declare function imageModelPreset(_model: string): ImageModelPreset;
 //#region src/index.d.ts
 declare const name = "dsh-agnes";
 /**
- * 插件注册工具前需等待 tools 服务就绪;
- * 工具执行经属性访问(ctx.shell)使用 shell 服务发起 curl,必须在 inject 中声明,
- * 否则运行时报 `cannot get property "shell" without inject`。
+ * 插件注册工具前需等待 tools 服务就绪(0.2.x 起 HTTP 请求走 node 原生 fetch,
+ * 不再依赖 shell 服务)。
  */
-declare const inject: readonly ["tools", "shell"];
-/** 设置命名空间；浏览器端会再次声明。 */
-declare const AGNES_SETTINGS_NAMESPACE: import("@deepseek-ai/dsh-settings").SettingsNamespace;
+declare const inject: readonly ["tools"];
 /** 支持的尺寸档位。 */
 type AgnesSizeTier = typeof SIZE_TIERS[number];
 /** 支持的宽高比。 */
@@ -101,15 +102,18 @@ interface Config {
   video25Seconds: number;
   /** Video 2.5 系列输出分辨率档位;flash 仅支持 720P(构建时自动收敛)。 */
   video25Size: Video25Size;
+  /** API 站点:china=国内站,international=国际站。 */
+  apiSite: ApiSite;
 }
 /** schema 无法表达的跨字段约束(如 8n+1 帧数)统一在这里校验。@throws 不合法时抛出带字段名的错误。 */
 declare function assertConfig(config: Config): void;
 declare const Config: z<Config>;
 /**
- * 注册工具并连接设置命名空间。
- * 每次调用读取命名空间的解析值，因此设置修改无需重启即可生效；
- * 模型名称与默认参数同样来自该命名空间，不硬编码在工具内。
+ * 注册工具(0.2.x 起:插件 config schema 由宿主 SettingsForms 直接投影为设置表单,
+ * 不再需要 0.1.x 的 installSettingsSection;config 变更经 cordis 语义重新 apply,
+ * 因此工具始终读取当前 config,修改默认参数无需重启即生效)。
+ * 设置页数据经自建路由读写用户覆盖层,同样即时生效。
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { AGNES_SETTINGS_NAMESPACE, type AgnesModelOption, AgnesRatio, AgnesSizeTier, Config, IMAGE_MODEL_CATALOG, IMAGE_MODEL_IDS, type ImageModelPreset, VIDEO_MODEL_CATALOG, VIDEO_MODEL_IDS, type VideoModelPreset, apply, assertConfig, imageModelPreset, inject, name, videoModelPreset };
+export { type AgnesModelOption, AgnesRatio, AgnesSizeTier, Config, IMAGE_MODEL_CATALOG, IMAGE_MODEL_IDS, type ImageModelPreset, VIDEO_MODEL_CATALOG, VIDEO_MODEL_IDS, type VideoModelPreset, apply, assertConfig, imageModelPreset, inject, name, videoModelPreset };

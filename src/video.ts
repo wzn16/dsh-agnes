@@ -1,8 +1,8 @@
 /**
  * `agnes_video_generate` 工具:通过 Agnes 视频 API 实现文生视频、图生视频和关键帧动画。
  * 视频生成是异步任务:先创建任务,再轮询查询结果直到完成或失败。
- * 请求体写入 curl 标准输入,密钥通过进程环境传递,均不进入命令行。
- * 模型名称与默认 width/height/num_frames/frame_rate 来自设置命名空间(设置页的 Agnes 标签页),
+ * 请求经 node 原生 fetch 直连 API(0.2.x 起不再经宿主 shell+curl)。
+ * 模型名称与默认 width/height/num_frames/frame_rate 来自插件配置(设置页的 Agnes 标签页),
  * 不硬编码,上游模型升级时改设置即可。
  */
 
@@ -11,23 +11,21 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JsonValue, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { ShellExecutor } from '@deepseek-ai/dsh-shell'
-// 仅用于类型:引入 shell 的 Context 合并。
-import type {} from '@deepseek-ai/dsh-shell'
 
-import { AGNES_API_KEY_REF, splitAgnesStatus } from './image.ts'
+import { AGNES_API_KEY_REF } from './image.ts'
+import { apiEndpoint, getJson, postJson, type ApiResult } from './http.ts'
 
-/** Agnes 视频 API 端点:创建任务。 */
-export const AGNES_VIDEO_API_URL = 'https://api.agnes-ai.cn/v1/videos'
+/** 视频创建 API 路径(主机按 apiSite 站点解析)。 */
+export const AGNES_VIDEO_API_PATH = '/v1/videos'
 
-/** Agnes 视频 API 端点:按 video_id 查询结果(推荐)。 */
-export const AGNES_VIDEO_QUERY_URL = 'https://api.agnes-ai.cn/agnesapi'
+/** 视频查询 API 路径(主机按 apiSite 站点解析)。 */
+export const AGNES_VIDEO_QUERY_PATH = '/agnesapi'
 
 /** 视频生成模型的文档默认值;仅作 schema 默认,实际模型始终读自设置。 */
 export const DEFAULT_VIDEO_MODEL = 'agnes-video-v2.0'
 
-/** 创建/查询单次请求的 curl 网络超时。 */
-export const AGNES_VIDEO_CURL_TIMEOUT_S = 60
+/** 创建/查询单次请求的网络超时。 */
+export const AGNES_VIDEO_HTTP_TIMEOUT_S = 60
 
 /** 轮询查询结果的时间间隔。 */
 export const AGNES_VIDEO_POLL_INTERVAL_MS = 5_000
@@ -121,7 +119,7 @@ export interface AgnesVideoArgs {
   num_inference_steps?: number
 }
 
-/** 调用时由设置命名空间解析出的视频默认值;模型名随上游升级在设置中修改。 */
+/** 调用时由插件配置解析出的视频默认值;模型名随上游升级在设置中修改。 */
 export interface VideoDefaults {
   /** 视频生成模型名称。 */
   model: string
@@ -137,6 +135,8 @@ export interface VideoDefaults {
   seconds25: number
   /** Video 2.5 系列输出分辨率档位。 */
   size25: Video25Size
+  /** 当前 API 站点。 */
+  apiSite: string
 }
 
 /** 创建任务响应中的关键字段。 */
@@ -432,34 +432,18 @@ export function renderAgnesVideoValue(args: AgnesVideoArgs, value: AgnesVideoVal
   return [{ type: 'text', text: lines.join('\n') }]
 }
 
-/**
- * 执行一次 curl 请求,拆分响应体与末尾状态码并做统一错误处理。
- * 密钥通过进程环境传递,不进入命令行;请求体可经 stdin 传入。
- */
-async function runCurl(shell: ShellExecutor, apiKey: string, command: string, signal: AbortSignal, stdin?: string): Promise<string> {
-  const spec = shell.resolve({
-    command,
-    stdin,
-    env: { [AGNES_API_KEY_REF]: apiKey },
-    stdoutMaxBytes: AGNES_VIDEO_STDOUT_MAX_BYTES,
-    timeoutMs: AGNES_VIDEO_CURL_TIMEOUT_S * 1000,
-    signal,
-  })
-  const result = await shell.run(spec)
+/** 统一错误处理:把 ApiResult 变成 JSON 文本或抛出面向模型的错误。 */
+function ensureJson(result: ApiResult): string {
   if (result.timedOut || result.aborted) {
-    throw new Error(`视频 API 请求${result.timedOut ? '超时' : '被取消'}(${result.timeoutMs}ms),请稍后重试。`)
+    throw new Error(`视频 API 请求${result.timedOut ? '超时' : '被取消'}(${AGNES_VIDEO_HTTP_TIMEOUT_S}s),请稍后重试。`)
   }
-  if (result.exitCode !== 0) {
-    throw new Error(`Agnes API 请求失败(exit ${result.exitCode}):${result.stderr.text.slice(0, 500)}`)
+  if (!result.ok) {
+    throw new Error(`Agnes API 返回 HTTP ${result.status}:${result.text.slice(0, 800)}`)
   }
-  if (result.stdout.truncated) {
+  if (result.truncated) {
     throw new Error('Agnes API 响应过大,超出捕获上限。')
   }
-  const { jsonText, status } = splitAgnesStatus(result.stdout.text)
-  if (status !== null && (status < 200 || status >= 300)) {
-    throw new Error(`Agnes API 返回 HTTP ${status}:${jsonText.slice(0, 800)}`)
-  }
-  return jsonText
+  return result.text
 }
 
 /** 等待指定时长,提前触发 abort 时立即返回。 */
@@ -483,15 +467,15 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
  * V2.0 亦支持该参数,无副作用。
  * @throws 超过总预算或调用被取消时抛出面向模型的错误。
  */
-async function pollAgnesVideo(shell: ShellExecutor, apiKey: string, videoId: string, model: string, signal: AbortSignal): Promise<AgnesVideoValue> {
+async function pollAgnesVideo(apiKey: string, videoId: string, model: string, apiSite: string, signal: AbortSignal): Promise<AgnesVideoValue> {
   const deadline = Date.now() + AGNES_VIDEO_TOOL_TIMEOUT_MS
-  const queryCommand = `curl -sS --max-time ${AGNES_VIDEO_CURL_TIMEOUT_S} -G ${AGNES_VIDEO_QUERY_URL} --data-urlencode "video_id=${videoId}" --data-urlencode "model_name=${model}" -H "Authorization: Bearer $AGNES_API_KEY" -w '\\n__AGNES_STATUS__%{http_code}'`
+  const queryUrl = apiEndpoint(apiSite, AGNES_VIDEO_QUERY_PATH) + '?' + new URLSearchParams({ video_id: videoId, model_name: model })
   let value: AgnesVideoValue
   for (;;) {
     if (signal.aborted) {
       throw new Error(`视频生成查询被取消(video_id=${videoId})。`)
     }
-    value = parseAgnesVideoQuery(await runCurl(shell, apiKey, queryCommand, signal))
+    value = parseAgnesVideoQuery(ensureJson(await getJson(queryUrl, apiKey, AGNES_VIDEO_HTTP_TIMEOUT_S * 1000, signal, AGNES_VIDEO_STDOUT_MAX_BYTES)))
     if (value.status === 'completed' || value.status === 'failed') return value
     const remaining = deadline - Date.now()
     if (remaining <= 0) {
@@ -602,14 +586,19 @@ export function applyAgnesVideoTool(ctx: Context, defaults: () => VideoDefaults)
         throw new Error('视频模型名为空:请在设置页的 Agnes 标签页中填写 videoModel。')
       }
       const body = buildAgnesVideoRequestBody(args, currentDefaults)
-      const shell = ctx.shell
-      const createCommand = `curl -sS --max-time ${AGNES_VIDEO_CURL_TIMEOUT_S} -X POST ${AGNES_VIDEO_API_URL} -H "Authorization: Bearer $AGNES_API_KEY" -H "Content-Type: application/json" --data-binary @- -w '\\n__AGNES_STATUS__%{http_code}'`
-      const task = parseAgnesVideoTask(await runCurl(shell, resolvedKey.value, createCommand, exec.signal, JSON.stringify(body)))
+      const task = parseAgnesVideoTask(ensureJson(await postJson(
+        apiEndpoint(currentDefaults.apiSite, AGNES_VIDEO_API_PATH),
+        resolvedKey.value,
+        JSON.stringify(body),
+        AGNES_VIDEO_HTTP_TIMEOUT_S * 1000,
+        exec.signal,
+        AGNES_VIDEO_STDOUT_MAX_BYTES,
+      )))
       const videoId = task.video_id ?? task.task_id ?? task.id
       if (videoId === undefined) {
         throw new Error(`Agnes API 未返回 video_id/task_id:${JSON.stringify(task)}`)
       }
-      return await pollAgnesVideo(shell, resolvedKey.value, videoId, currentDefaults.model, exec.signal)
+      return await pollAgnesVideo(resolvedKey.value, videoId, currentDefaults.model, currentDefaults.apiSite, exec.signal)
     },
   }))
 }
